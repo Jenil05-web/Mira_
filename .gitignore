@@ -1,0 +1,7 @@
+.env
+mira_data/
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+venv/
+.venv/
