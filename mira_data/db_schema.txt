@@ -1,0 +1,63 @@
+DATABASE SCHEMA (SQLite):
+
+TABLE: patients
+  - subject_id (INTEGER)
+  - gender (TEXT)
+  - anchor_age (INTEGER)
+  - anchor_year (INTEGER)
+  - anchor_year_group (TEXT)
+  - dod (TEXT)
+  Sample row: {'subject_id': 10014729, 'gender': 'F', 'anchor_age': 21, 'anchor_year': 2125, 'anchor_year_group': '2011 - 2013', 'dod': None}
+
+TABLE: admissions
+  - subject_id (INTEGER)
+  - hadm_id (INTEGER)
+  - admittime (TEXT)
+  - dischtime (TEXT)
+  - deathtime (TEXT)
+  - admission_type (TEXT)
+  - admit_provider_id (TEXT)
+  - admission_location (TEXT)
+  - discharge_location (TEXT)
+  - insurance (TEXT)
+  - language (TEXT)
+  - marital_status (TEXT)
+  - race (TEXT)
+  - edregtime (TEXT)
+  - edouttime (TEXT)
+  - hospital_expire_flag (INTEGER)
+  Sample row: {'subject_id': 10004235, 'hadm_id': 24181354, 'admittime': '2196-02-24 14:38:00', 'dischtime': '2196-03-04 14:02:00', 'deathtime': None, 'admission_type': 'URGENT', 'admit_provider_id': 'P03YMR', 'admission_location': 'TRANSFER FROM HOSPITAL', 'discharge_location': 'SKILLED NURSING FACILITY', 'insurance': 'Medicaid', 'language': 'ENGLISH', 'marital_status': 'SINGLE', 'race': 'BLACK/CAPE VERDEAN', 'edregtime': '2196-02-24 12:15:00', 'edouttime': '2196-02-24 17:07:00', 'hospital_expire_flag': 0}
+
+TABLE: diagnoses_icd
+  - subject_id (INTEGER)
+  - hadm_id (INTEGER)
+  - seq_num (INTEGER)
+  - icd_code (TEXT)
+  - icd_version (INTEGER)
+  Sample row: {'subject_id': 10035185, 'hadm_id': 22580999, 'seq_num': 3, 'icd_code': '4139', 'icd_version': 9}
+
+TABLE: labevents
+  - labevent_id (INTEGER)
+  - subject_id (INTEGER)
+  - hadm_id (REAL)
+  - specimen_id (INTEGER)
+  - itemid (INTEGER)
+  - order_provider_id (TEXT)
+  - charttime (TEXT)
+  - storetime (TEXT)
+  - value (TEXT)
+  - valuenum (REAL)
+  - valueuom (TEXT)
+  - ref_range_lower (REAL)
+  - ref_range_upper (REAL)
+  - flag (TEXT)
+  - priority (TEXT)
+  - comments (TEXT)
+  Sample row: {'labevent_id': 172061, 'subject_id': 10014354, 'hadm_id': 29600294.0, 'specimen_id': 1808066, 'itemid': 51277, 'order_provider_id': None, 'charttime': '2148-08-16 00:00:00', 'storetime': '2148-08-16 01:30:00', 'value': '15.4', 'valuenum': 15.4, 'valueuom': '%', 'ref_range_lower': 10.5, 'ref_range_upper': 15.5, 'flag': None, 'priority': 'ROUTINE', 'comments': None}
+
+TABLE: d_labitems
+  - itemid (INTEGER)
+  - label (TEXT)
+  - fluid (TEXT)
+  - category (TEXT)
+  Sample row: {'itemid': 50808, 'label': 'Free Calcium', 'fluid': 'Blood', 'category': 'Blood Gas'}
