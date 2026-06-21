@@ -46,7 +46,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from langgraph.graph import StateGraph, END
 from langgraph.checkpoint.memory import MemorySaver
 
-# ── Suppress benign NumPy warnings ───────────────────────────────────────
+# ── Suppress benign NumPy warnings 
 import warnings
 warnings.filterwarnings("ignore", category=RuntimeWarning, module="numpy")
 
@@ -55,20 +55,15 @@ from trend_agent import TrendAgent
 
 load_dotenv()  # reads .env in the project root into os.environ
 
-
-# ══════════════════════════════════════════════════════════════════════════
 # BASE DIRECTORY — for absolute paths
-# ══════════════════════════════════════════════════════════════════════════
+
 
 BASE_DIR = Path(__file__).parent
 
-
-# ══════════════════════════════════════════════════════════════════════════
 # CONFIG
-# ══════════════════════════════════════════════════════════════════════════
+
 
 class Config:
-    """Central config. Set OPENAI_API_KEY in a .env file — never hardcode it here."""
     OPENAI_API_KEY  = os.environ.get("OPENAI_API_KEY")
     DB_PATH         = BASE_DIR / "mira_data" / "mimic.db"
     FAISS_PATH      = BASE_DIR / "mira_data" / "medical_faiss.index"
@@ -78,7 +73,7 @@ class Config:
     EMBEDDING_MODEL = "text-embedding-3-small"
     MAX_SQL_RETRIES = 3
 
-    @classmethod
+    @classmethod 
     def validate(cls):
         if not cls.OPENAI_API_KEY:
             raise ValueError(
@@ -92,10 +87,8 @@ class Config:
                 "Run notebook 01_data_setup.ipynb first."
             )
 
-
-# ══════════════════════════════════════════════════════════════════════════
 # STATE DEFINITION
-# ══════════════════════════════════════════════════════════════════════════
+
 
 class MIRAState(TypedDict):
     # Input
@@ -142,9 +135,9 @@ def make_initial_state(clinical_question: str) -> MIRAState:
     }
 
 
-# ══════════════════════════════════════════════════════════════════════════
+
 # MIRA ENGINE — wraps data layer, tools, agents, and the compiled graph
-# ══════════════════════════════════════════════════════════════════════════
+
 
 class MIRAEngine:
     """
@@ -160,7 +153,7 @@ class MIRAEngine:
         self._build_llm()
         self._build_graph()
 
-    # ── Data layer ───────────────────────────────────────────────────────
+    # ── Data layer 
     def _connect_data_layer(self):
         if not self.config.DB_PATH.exists():
             raise FileNotFoundError(
@@ -185,7 +178,7 @@ class MIRAEngine:
         )
         return np.array([r.embedding for r in response.data], dtype=np.float32)
 
-    # ── Tools ────────────────────────────────────────────────────────────
+    # ── Tools 
     def _build_tools(self):
         engine = self  # closure capture
 
@@ -312,7 +305,7 @@ RULES:
             return "retry"
         return "ok"
 
-    # ── Agent 1b — Lab Trajectory Analysis (TrendAgent) ──────────────────
+    # ── Agent 1b — Lab Trajectory Analysis (TrendAgent) 
     def agent1b_trend_analysis(self, state: MIRAState) -> MIRAState:
         """
         Runs after Agent 1 succeeds. Extracts the primary lab name and the
@@ -328,7 +321,7 @@ RULES:
         if not sql_result:
             return {**state, "trend_result": {}, "trend_summary": ""}
 
-        # ── 1. Pull subject_id from first SQL row ─────────────────────────
+        # ── 1. Pull subject_id from first SQL row 
         subject_id: Optional[int] = None
         try:
             rows = json.loads(sql_result).get("rows", [])
@@ -367,7 +360,7 @@ RULES:
         if not lab_name:
             return {**state, "trend_result": {}, "trend_summary": ""}
 
-        # ── 3. Run TrendAgent ─────────────────────────────────────────────
+        # ── 3. Run TrendAgent 
         try:
             trend_result = self.trend_agent.analyze_patient_lab(
                 subject_id=subject_id,
@@ -384,7 +377,7 @@ RULES:
 
         return {**state, "trend_result": trend_result, "trend_summary": trend_summary}
 
-    # ── Agent 2 — Semantic Cross-Ref ─────────────────────────────────────
+    # ── Agent 2 — Semantic Cross-Ref 
     def agent2_semantic_crossref(self, state: MIRAState) -> MIRAState:
         sql_context = state.get("sql_result", "") or "No patient data retrieved."
 
@@ -729,9 +722,9 @@ clinician never sees this field). Respond ONLY in JSON:
         )
 
 
-# ══════════════════════════════════════════════════════════════════════════
+
 # Module-level singleton helper (optional convenience for simple scripts)
-# ══════════════════════════════════════════════════════════════════════════
+
 
 _engine_instance: MIRAEngine | None = None
 
