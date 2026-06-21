@@ -849,7 +849,7 @@ with right_col:
         render_trend_panel(state.get("trend_result", {}))
 
         # Draft report
-        render_report_panel(state["clinical_reasoning"])
+        render_report_panel(state["clinical_analysis"])
 
         # Lab charts
         render_lab_charts(state)

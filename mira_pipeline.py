@@ -53,16 +53,23 @@ load_dotenv()  # reads .env in the project root into os.environ
 
 
 # ══════════════════════════════════════════════════════════════════════════
+# BASE DIRECTORY — for absolute paths
+# ══════════════════════════════════════════════════════════════════════════
+
+BASE_DIR = Path(__file__).parent
+
+
+# ══════════════════════════════════════════════════════════════════════════
 # CONFIG
 # ══════════════════════════════════════════════════════════════════════════
 
 class Config:
     """Central config. Set OPENAI_API_KEY in a .env file — never hardcode it here."""
     OPENAI_API_KEY  = os.environ.get("OPENAI_API_KEY")
-    DB_PATH         = Path("./mira_data/mimic.db")
-    FAISS_PATH      = Path("./mira_data/medical_faiss.index")
-    META_PATH       = Path("./mira_data/faiss_metadata.pkl")
-    SCHEMA_PATH     = Path("./mira_data/db_schema.txt")
+    DB_PATH         = BASE_DIR / "mira_data" / "mimic.db"
+    FAISS_PATH      = BASE_DIR / "mira_data" / "medical_faiss.index"
+    META_PATH       = BASE_DIR / "mira_data" / "faiss_metadata.pkl"
+    SCHEMA_PATH     = BASE_DIR / "mira_data" / "db_schema.txt"
     LLM_MODEL       = "gpt-4o"
     EMBEDDING_MODEL = "text-embedding-3-small"
     MAX_SQL_RETRIES = 3
@@ -73,6 +80,12 @@ class Config:
             raise ValueError(
                 "OPENAI_API_KEY not found. Create a .env file in the project "
                 "root with:\n  OPENAI_API_KEY=sk-your-key-here"
+            )
+        # Ensure data directory exists
+        if not cls.DB_PATH.parent.exists():
+            raise FileNotFoundError(
+                f"Data directory not found at {cls.DB_PATH.parent}. "
+                "Run notebook 01_data_setup.ipynb first."
             )
 
 
@@ -101,7 +114,7 @@ class MIRAState(TypedDict):
     guidelines: str
 
     # Agent 3 — Clinical Reasoning
-    clinical_reasoning: str
+    clinical_analysis: str
 
     # Agent 4 — Critic & Safety
     final_report: str
@@ -119,7 +132,7 @@ def make_initial_state(clinical_question: str) -> MIRAState:
         "clinical_question": clinical_question,
         "sql_query_used": "", "sql_result": "", "sql_retry_count": 0, "sql_error": "",
         "trend_result": {}, "trend_summary": "",
-        "search_query_used": "", "guidelines": "", "clinical_reasoning": "",
+        "search_query_used": "", "guidelines": "", "clinical_analysis": "",
         "final_report": "", "safety_flags": [], "approved": False,
         "human_decision": "", "human_feedback": ""
     }
@@ -497,7 +510,7 @@ just didn't find a match this time.{relevance_warning}{feedback_context}{trend_i
         ])
         reasoning = response.content.strip()
 
-        return {**state, "clinical_reasoning": reasoning, "human_decision": "", "human_feedback": ""}
+        return {**state, "clinical_analysis": reasoning, "human_decision": "", "human_feedback": ""}
 
     def stream_clinical_reasoning(self, state: MIRAState) -> Generator[str, None, str]:
         """
@@ -559,7 +572,7 @@ that column.{feedback_context}{trend_instruction}"""
 
     # ── Agent 4 — Critic & Safety ─────────────────────────────────────────
     def agent4_critic_safety(self, state: MIRAState) -> MIRAState:
-        reasoning  = state.get("clinical_reasoning", "")
+        reasoning  = state.get("clinical_analysis", "")
         sql_result = state.get("sql_result", "")
         guidelines = state.get("guidelines", "")
 
@@ -739,7 +752,7 @@ if __name__ == "__main__":
     print(paused_state.get("trend_summary") or "  (no trend data — insufficient readings or lab not detected)")
 
     print("\n🛑 Paused for human review. Agent 3's draft:\n")
-    print(paused_state["clinical_reasoning"])
+    print(paused_state["clinical_analysis"])
 
     print("\n▶️  Auto-approving for smoke test...")
     final_state = engine.submit_human_decision(cfg, "approve")
