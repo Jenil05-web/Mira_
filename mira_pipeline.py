@@ -46,6 +46,10 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from langgraph.graph import StateGraph, END
 from langgraph.checkpoint.memory import MemorySaver
 
+# ── Suppress benign NumPy warnings ───────────────────────────────────────
+import warnings
+warnings.filterwarnings("ignore", category=RuntimeWarning, module="numpy")
+
 # ── TrendAgent lives in trend_agent.py alongside this file ───────────────
 from trend_agent import TrendAgent
 

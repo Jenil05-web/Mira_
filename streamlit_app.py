@@ -14,6 +14,9 @@ Changes from previous version:
 Run with: streamlit run streamlit_app.py
 """
 
+import warnings
+warnings.filterwarnings("ignore", category=RuntimeWarning)
+
 import json
 import re
 import time
