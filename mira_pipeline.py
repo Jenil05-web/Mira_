@@ -51,7 +51,7 @@ import warnings
 warnings.filterwarnings("ignore", category=RuntimeWarning, module="numpy")
 
 # ── TrendAgent lives in trend_agent.py alongside this file ───────────────
-from trend_agent import TrendAgent
+from Mira_project.trend_agent import TrendAgent
 
 load_dotenv()  # reads .env in the project root into os.environ
 

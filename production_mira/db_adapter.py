@@ -330,7 +330,7 @@ def create_adapter(config: dict):
         adapter = create_adapter(config_manager.get_data_source())
         schema_str = adapter.get_schema_description()
     """
-    from fhir_adapter import FHIRAdapter, FHIRAuthHandler
+    from Mira_project.production_mira.fhir_adapter import FHIRAdapter, FHIRAuthHandler
 
     adapter_type = config.get("type", "db")
 
