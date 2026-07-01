@@ -405,4 +405,3 @@ if __name__ == "__main__":
         print(f"\n✅ Admin login: {admin.display_name}")
         print(f"  manage_users: {admin.can('manage_users')}")
         print(f"  view_audit_log: {admin.can('view_audit_log')}")
-            
