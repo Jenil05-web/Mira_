@@ -46,7 +46,8 @@ from langgraph.checkpoint.memory import MemorySaver
 from config_manager import ConfigManager
 from db_adapter import DBAdapter, create_adapter
 from audit_logger import AuditLogger
-from Mira_project.trend_agent import TrendAgent
+from trend_agent import TrendAgent
+
 
 logger = logging.getLogger(__name__)
 
@@ -138,19 +139,19 @@ class VectorStore:
             return self._search_pgvector(query, k, hospital_id)
         return self._search_faiss(query, k)
 
-    def _search_pgvector(self, query: str, k: int,
-                         hospital_id: str) -> list[dict]:
+    def _search_pgvector(self, query: str, k: int, hospital_id: str) -> list[dict]:
         from sqlalchemy import text
         vec = self._embed(query)[0].tolist()
+        vec_str = "[" + ",".join(str(x) for x in vec) + "]"
         with self._engine.connect() as conn:
             rows = conn.execute(text("""
                 SELECT source, topic, content,
-                       1 - (embedding <=> :vec::vector) AS similarity
+                       1 - (embedding <=> CAST(:vec AS vector)) AS similarity
                 FROM mira_embeddings
                 WHERE hospital_id = :hid OR hospital_id = 'global'
-                ORDER BY embedding <=> :vec::vector
+                ORDER BY embedding <=> CAST(:vec AS vector)
                 LIMIT :k
-            """), {"vec": str(vec), "hid": hospital_id, "k": k}).fetchall()
+            """), {"vec": vec_str, "hid": hospital_id, "k": k}).fetchall()
         return [
             {"source": r.source, "topic": r.topic, "text": r.content,
              "rank": i + 1, "relevance_score": round(float(r.similarity), 4)}
@@ -199,20 +200,8 @@ class MIRAEngineProd:
         self.vector_store = VectorStore(self.cfg, self.openai_client)
 
         # ── Checkpointer (PostgresSaver or MemorySaver) ──────────────────
-        ck_cfg = self.cfg.get_checkpoint_config()
-        if ck_cfg["type"] == "postgres":
-            try:
-                from langgraph.checkpoint.postgres import PostgresSaver
-                self.checkpointer = PostgresSaver.from_conn_string(
-                    ck_cfg["connection_string"]
-                )
-                logger.info("Checkpointer: PostgresSaver (Supabase)")
-            except Exception as e:
-                logger.warning(f"PostgresSaver failed ({e}), falling back to MemorySaver")
-                self.checkpointer = MemorySaver()
-        else:
-            self.checkpointer = MemorySaver()
-            logger.info("Checkpointer: MemorySaver (dev)")
+        self.checkpointer = MemorySaver()
+        logger.info("Checkpointer: MemorySaver")
 
         # ── Per-hospital data adapters (lazy, cached) ─────────────────
         self._adapters: dict[str, object] = {}

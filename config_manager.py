@@ -30,6 +30,7 @@ INSTALL:
   pip install google-cloud-secret-manager  # only needed in GCP production
 """
 
+
 import logging
 import os
 from pathlib import Path
@@ -231,23 +232,24 @@ class ConfigManager:
         return {"type": "memory"}
 
     def _supabase_db_url(self) -> str:
-        """Builds a SQLAlchemy-compatible Supabase PostgreSQL URL."""
-        raw = self.supabase_url
-        if raw.startswith("https://"):
-            ref = raw.replace("https://", "").replace(".supabase.co", "")
-            password = self.supabase_service_role_key or self.supabase_anon_key
-            return f"postgresql://postgres:{password}@db.{ref}.supabase.co:5432/postgres"
-        return raw
+       raw = self.supabase_url
+       if raw.startswith("https://"):
+        ref = raw.replace("https://", "").replace(".supabase.co", "")
+        # Use dedicated DB password, fall back to service role key
+        password = self.get("SUPABASE_DB_PASSWORD", "EtnV1l2E7359NakT")
+       return (f"postgresql://postgres.tfrlbotgzxxdqwviemiz:{password}"
+               f"@aws-1-ap-southeast-2.pooler.supabase.com:6543/postgres")
+       return raw
 
     def get_audit_config(self) -> dict:
-        return {
-            "enabled": self.get("AUDIT_LOGGING_ENABLED", "true").lower() == "true",
-            "table": "mira_audit_log",
-            "connection_string": (
-                self._supabase_db_url() if self.supabase_url
-                else self.get("DATABASE_URL", "sqlite:///./mira_data/mimic.db")
-            ),
-        }
+       return {
+        "enabled": self.get("AUDIT_LOGGING_ENABLED", "true").lower() == "true",
+        "table": "mira_audit_log",
+        "connection_string": (
+            self._supabase_db_url() if self.supabase_url
+            else self.get("DATABASE_URL", "sqlite:///./mira_data/mimic.db")
+        ),
+    }
 
     # ── Startup validation ───────────────────────────────────────────────
     def _validate(self):
