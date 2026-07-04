@@ -1,0 +1,51 @@
+# MIRA .dockerignore
+# Keeps the Docker image lean — excludes dev/local files
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Virtual environments
+venv/
+.venv/
+env/
+llm_env/
+
+# Secrets — NEVER bake into image, use GCP Secret Manager
+.env
+.env.*
+!.env.example
+
+# Local data files — loaded from Supabase in production
+mira_data/
+*.db
+*.sqlite3
+*.index
+*.pkl
+
+# MIMIC dataset — never ship in container
+mimic-iv-clinical-database-demo*/
+
+# Dev notebooks
+*.ipynb
+notebooks_logic/
+.ipynb_checkpoints/
+
+# Git
+.git/
+.gitignore
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Test / seed scripts
+seed_embeddings.py

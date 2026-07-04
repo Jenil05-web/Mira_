@@ -1,0 +1,59 @@
+# ── MIRA Production Dockerfile ───────────────────────────────────────────
+# Optimised for AWS App Runner:
+#   - Python 3.11 slim base
+#   - Non-root user (security)
+#   - Port 8080 (App Runner default)
+#   - Streamlit headless mode
+
+FROM python:3.11-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
+ENV PORT=8080
+
+WORKDIR /app
+
+# System deps for psycopg2 + faiss
+RUN apt-get update && apt-get install -y \
+    gcc \
+    g++ \
+    libpq-dev \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Python deps first (layer cache)
+COPY requirements.txt .
+RUN pip install --no-cache-dir --upgrade pip && \
+    pip install --no-cache-dir -r requirements.txt
+
+# Copy application code
+COPY . .
+
+# Non-root user
+RUN useradd -m -u 1000 mira && chown -R mira:mira /app
+USER mira
+
+# Streamlit config
+RUN mkdir -p /home/mira/.streamlit && cat > /home/mira/.streamlit/config.toml << 'EOF'
+[server]
+port = 8080
+address = "0.0.0.0"
+headless = true
+enableCORS = false
+enableXsrfProtection = false
+
+[browser]
+gatherUsageStats = false
+
+[theme]
+base = "light"
+EOF
+
+# Health check for App Runner
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
+    CMD curl -f http://localhost:8080/_stcore/health || exit 1
+
+CMD ["streamlit", "run", "streamlit_app_prod.py", \
+     "--server.port=8080", \
+     "--server.address=0.0.0.0", \
+     "--server.headless=true"]
