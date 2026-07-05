@@ -78,7 +78,7 @@ if [ -f .env ]; then
     store_secret "SUPABASE_SERVICE_ROLE_KEY" "$SUPABASE_SERVICE_ROLE_KEY"
     store_secret "SUPABASE_DB_PASSWORD"     "$SUPABASE_DB_PASSWORD"
     store_secret "SUPABASE_DIRECT_URL"      "$SUPABASE_DIRECT_URL"
-    store_secret "MIRA_JWT_SECRET"          "$MIRA_JWT_SECRET"
+    
 else
     echo "  ⚠ .env not found — add secrets manually in AWS Secrets Manager"
 fi
