@@ -326,15 +326,9 @@ def init_session():
 init_session()
 
 
-# ── Render restart guard ──────────────────────────────────────────────
-# On Render free tier, the app spins down and MemorySaver is wiped.
-# Force reset any stale thread state on every cold start.
-if "engine_start_time" not in st.session_state:
-    st.session_state.engine_start_time = time.time()
+# Clear stale thread config on cold start (Render spin-down fix)
+if st.session_state.get("thread_config") and st.session_state.stage == "idle":
     st.session_state.thread_config = None
-    st.session_state.stage = "idle"
-    st.session_state.paused_state = None
-    st.session_state.final_state = None
 
 
 # ══════════════════════════════════════════════════════════════════════════
