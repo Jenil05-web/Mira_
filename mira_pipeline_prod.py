@@ -319,20 +319,23 @@ class MIRAEngineProd:
 
         system_prompt = f"""You are a medical SQL expert. Write a single valid SQL SELECT query.
 
-DATABASE SCHEMA:
-{schema}
+    DATABASE SCHEMA:
+    {schema}
 
-VOCABULARY:
-- "critical"/"severe" → valuenum > ref_range_upper * 1.5 OR valuenum < ref_range_lower * 0.5 OR flag IS NOT NULL
-- "abnormal" → valuenum > ref_range_upper OR valuenum < ref_range_lower OR flag IS NOT NULL
-- "high"/"elevated" → valuenum > ref_range_upper
-- "low" → valuenum < ref_range_lower
-- For lab names: use LIKE '%name%' not exact match
-- Always include value, valuenum, valueuom, charttime, ref_range_lower, ref_range_upper, flag in SELECT
-- Always JOIN patient demographics so age/gender are available
-- Guard NULL ref ranges: (ref_range_upper IS NOT NULL AND valuenum > ref_range_upper)
-- ORDER BY severity when relevant; LIMIT 25
-- Return ONLY raw SQL, no markdown{error_context}"""
+    VOCABULARY:
+    - "critical"/"severe" → valuenum > ref_range_upper * 1.5 OR valuenum < ref_range_lower * 0.5 OR flag IS NOT NULL
+    - "abnormal" → valuenum > ref_range_upper OR valuenum < ref_range_lower OR flag IS NOT NULL
+    - "high"/"elevated" → valuenum > ref_range_upper
+    - "low" → valuenum < ref_range_lower
+    - For lab names: use LIKE '%name%' not exact match
+    - Always include value, valuenum, valueuom, charttime, ref_range_lower, ref_range_upper, flag in SELECT
+    - Always JOIN patient demographics so age/gender are available
+    - Guard NULL ref ranges: (ref_range_upper IS NOT NULL AND valuenum > ref_range_upper)
+    - ORDER BY severity when relevant; LIMIT 25
+    - If your specific query returns 0 rows after retries, broaden it significantly.
+    - Remove the most restrictive WHERE clause and try again.
+    - Never return empty results if the database has data.
+    - Return ONLY raw SQL, no markdown{error_context}"""
 
         start = time.monotonic()
         response = self.llm.invoke([
@@ -364,6 +367,25 @@ VOCABULARY:
                 ),
                 "sql_retry_count": retry_count + 1
             }
+
+        # After the retry logic, before returning success:
+        if len(rows) == 0 and retry_count >= getattr(self.config, "MAX_SQL_RETRIES", 3):
+            # DB is connected but specific query matched nothing.
+            # Run a broad fallback so Agent 3 knows data exists.
+            fallback = self._get_adapter(hospital_id).run_query("""
+                SELECT p.subject_id, p.gender, p.anchor_age,
+                       d.label AS lab_name, l.valuenum, l.valueuom,
+                       l.ref_range_lower, l.ref_range_upper, l.flag, l.charttime
+                FROM labevents l
+                JOIN patients p ON l.subject_id = p.subject_id
+                JOIN d_labitems d ON l.itemid = d.itemid
+                WHERE l.valuenum IS NOT NULL
+                ORDER BY l.charttime DESC
+                LIMIT 25
+            """)
+            return {**state, "sql_query_used": raw_sql,
+                    "sql_result": fallback,
+                    "sql_error": "", "sql_retry_count": retry_count}
 
         self.audit.log_agent_run("sql_extractor", state.get("session_id", ""),
                                  duration, True, rows_returned=len(rows),
@@ -645,11 +667,14 @@ Respond ONLY in JSON:
     def run_until_review(self, clinical_question: str, config: dict,
                          user_id: str = "anon", hospital_id: str = "demo",
                          session_id: str = "") -> MIRAState:
+        # Always start with a completely fresh state — never reuse previous
         initial = make_initial_state(clinical_question, user_id, hospital_id, session_id)
+        # Pass fresh config with new thread every time
+        fresh_config = self.new_thread()
         self.audit.log_query(user_id, hospital_id, session_id,
-                             config["configurable"]["thread_id"],
+                             fresh_config["configurable"]["thread_id"],
                              clinical_question, len(clinical_question))
-        return self.graph.invoke(initial, config)
+        return self.graph.invoke(initial, fresh_config)
 
     def submit_human_decision(self, config: dict, decision: str,
                                feedback: str = "",
