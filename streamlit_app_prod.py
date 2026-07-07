@@ -21,7 +21,7 @@ import markdown as md_lib
 import streamlit as st
 
 from auth import AuthManager, require_auth, Role
-from config_manager import ConfigManager
+from config_manager import ConfigManager    
 from audit_logger import AuditLogger
 from mira_pipeline_prod import get_engine
 
@@ -315,7 +315,8 @@ def init_session():
         "paused_state": None,
         "final_state": None,
         "show_feedback_box": False,
-        "active_tab": "audit",   # "audit" | "admin"
+            "active_tab": "audit",   # "audit" | "admin"
+            "pending_question": "",
     }
     for key, val in defaults.items():
         if key not in st.session_state:
@@ -719,24 +720,26 @@ with tab_audit:
                 st.session_state.thread_config = None
                 st.rerun()
 
-    # ── Run handler ───────────────────────────────────────────────────────
-        if run_clicked and question.strip():
-             st.session_state.thread_config = engine.new_thread()
-             st.session_state.paused_state = None
-             st.session_state.final_state = None
-             st.session_state.stage = "running"
+    # ══════════════════════════════════════════════════════════════════════
+    # RUN HANDLER
+    # ══════════════════════════════════════════════════════════════════════
 
+    if run_clicked and question.strip() and st.session_state.stage == "idle":
+        st.session_state.pending_question = question.strip()
+        st.session_state.stage = "running"
+        st.rerun()
+
+    if st.session_state.stage == "running" and st.session_state.get("pending_question"):
         with right_col:
             ph = st.empty()
             with ph.container():
                 st.markdown('<div class="panel">', unsafe_allow_html=True)
                 render_processing_strip("Querying patient database")
-                time.sleep(0.3)
-                render_processing_strip("Cross-referencing clinical guidelines")
                 st.markdown('</div>', unsafe_allow_html=True)
 
+            st.session_state.thread_config = engine.new_thread()
             paused = engine.run_until_review(
-                question.strip(),
+                st.session_state.pending_question,
                 st.session_state.thread_config,
                 user_id=user.user_id,
                 hospital_id=user.hospital_id,
@@ -744,6 +747,7 @@ with tab_audit:
             )
             ph.empty()
 
+        st.session_state.pending_question = ""
         st.session_state.paused_state = paused
         st.session_state.stage = "awaiting_review"
         st.rerun()
