@@ -232,14 +232,14 @@ class ConfigManager:
         return {"type": "memory"}
 
     def _supabase_db_url(self) -> str:
-       raw = self.supabase_url
-       if raw.startswith("https://"):
-        ref = raw.replace("https://", "").replace(".supabase.co", "")
-        # Use dedicated DB password, fall back to service role key
-        password = self.get("SUPABASE_DB_PASSWORD", "EtnV1l2E7359NakT")
-       return (f"postgresql://postgres.tfrlbotgzxxdqwviemiz:{password}"
-               f"@aws-1-ap-southeast-2.pooler.supabase.com:6543/postgres")
-       return raw
+        raw = self.supabase_url
+        if raw and raw.startswith("https://"):
+            ref = raw.replace("https://", "").replace(".supabase.co", "")
+            password = self.get("SUPABASE_DB_PASSWORD", "")
+            # Use the {ref} variable instead of a hardcoded host
+            return (f"postgresql://postgres.{ref}:{password}"
+                    f"@aws-0-asia-south-1.pooler.supabase.com:6543/postgres")
+        return raw
 
     def get_audit_config(self) -> dict:
        return {

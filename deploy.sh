@@ -7,7 +7,7 @@
 set -e  # Exit on any error
 
 # ── CONFIG — update these ─────────────────────────────────────────────────
-PROJECT_ID="mira-ai-555"        # gcloud projects list
+PROJECT_ID="mira-clinical-501719"        # gcloud projects list
 REGION="asia-south1"                     # closest to India (Mumbai)
 SERVICE_NAME="mira-clinical"
 IMAGE_NAME="gcr.io/$PROJECT_ID/$SERVICE_NAME"
