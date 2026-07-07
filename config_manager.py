@@ -167,37 +167,29 @@ class ConfigManager:
         return self.deployment_env == "production"
 
     def get_data_source(self, hospital_id: str = "default") -> dict:
-        """
-        Returns the data source config for a given hospital_id.
-        In multi-tenant production each hospital has its own credentials.
+        # Direct override — if MIRA_DEFAULT_DB_URL is set, always use it
+        direct_url = self.get("MIRA_DEFAULT_DB_URL") or self.get("DATABASE_URL")
+        source_type = self.get("MIRA_DEFAULT_SOURCE_TYPE", "db")
 
-        Config keys follow the pattern:
-          MIRA_{HOSPITAL_ID}_SOURCE_TYPE   → fhir | db
-          MIRA_{HOSPITAL_ID}_FHIR_URL      → FHIR base URL
-          MIRA_{HOSPITAL_ID}_FHIR_AUTH     → open | bearer | smart_oauth2
-          MIRA_{HOSPITAL_ID}_DB_URL        → SQLAlchemy connection string
-        """
+        if direct_url and source_type == "db":
+            return {"type": "db", "connection_string": direct_url}
+
         prefix = f"MIRA_{hospital_id.upper()}"
-
         source_type = self.get(f"{prefix}_SOURCE_TYPE", "db")
 
         if source_type == "fhir":
             return {
                 "type": "fhir",
-                "base_url": self.get(f"{prefix}_FHIR_URL",
-                                     "http://hapi.fhir.org/baseR4"),
+                "base_url": self.get(f"{prefix}_FHIR_URL", "http://hapi.fhir.org/baseR4"),
                 "auth_mode": self.get(f"{prefix}_FHIR_AUTH", "open"),
                 "token": self.get(f"{prefix}_FHIR_TOKEN", ""),
                 "client_id": self.get(f"{prefix}_FHIR_CLIENT_ID", ""),
                 "client_secret": self.get(f"{prefix}_FHIR_CLIENT_SECRET", ""),
                 "token_url": self.get(f"{prefix}_FHIR_TOKEN_URL", ""),
             }
-        else:
-            db_url = self.get(
-                f"{prefix}_DB_URL",
-                self.get("DATABASE_URL", "sqlite:///./mira_data/mimic.db")
-            )
-            return {"type": "db", "connection_string": db_url}
+
+        db_url = self.get(f"{prefix}_DB_URL", direct_url or "sqlite:///./mira_data/mimic.db")
+        return {"type": "db", "connection_string": db_url}
 
     def get_vector_store_config(self) -> dict:
         """
