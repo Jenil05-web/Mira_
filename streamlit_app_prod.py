@@ -10,6 +10,43 @@ Differences from streamlit_app.py (dev):
   - Audit trail: every action logged via AuditLogger
   - Uses mira_pipeline_prod.py instead of mira_pipeline.py
 
+FIXES IN THIS VERSION (aligned with the enhanced mira_pipeline_prod.py)
+-------------------------------------------------------------------------
+1. REVISION REQUEST WAS BROKEN AT THE UI LAYER
+   The old "Send revision request" button called
+   `submit_human_decision(..., "approve", ...)` — the wrong decision — and
+   never passed the clinician's typed feedback at all, so even a perfectly
+   correct backend had nothing to revise. Fixed: it now sends
+   `"reject"` with `feedback=feedback_text`, which matches what the
+   pipeline expects.
+
+2. THE ORIGINAL QUESTION WAS SILENTLY LOST
+   `pending_question` was cleared right after the initial run, but was
+   still the value used later when calling `submit_human_decision(...,
+   clinical_question=...)` on approve/reject — so it was always sent as
+   `""`. This matters a lot with the new pipeline, which uses
+   `clinical_question` to validate stale-session recovery. Fixed: the
+   question is now kept in a separate, durable `current_question` field
+   that persists for the life of the audit.
+
+3. NO WAY TO ABORT / RESET MID-AUDIT
+   Previously "Start a new audit" only appeared after a report was fully
+   finalized. Fixed: a "New Audit" reset is now available from the left
+   panel at every stage (idle, running, awaiting review, complete), and
+   uses the new `engine.start_new_audit()` helper.
+
+4. NO VISIBILITY INTO DATA-QUALITY SIGNALS
+   The pipeline now reports `data_status` (ok / patient_not_found /
+   no_data / broadened_query / list_insufficient), which patient IDs
+   were requested vs. found vs. missing, and richer safety flags
+   (including `id_mismatch:...`). None of this reached the UI before.
+   Fixed: a status banner now surfaces these plainly, and the "View data
+   sources" panel shows requested/found/missing patient IDs and detected
+   query intent (list vs. single patient, recognized conditions).
+
+5. SAFETY FLAGS WERE SHOWN AS RAW, UNEXPLAINED STRINGS
+   Fixed: flags are now mapped to short, human-readable explanations.
+
 Run with: streamlit run streamlit_app_prod.py
 """
 
@@ -21,7 +58,7 @@ import markdown as md_lib
 import streamlit as st
 
 from auth import AuthManager, require_auth, Role
-from config_manager import ConfigManager    
+from config_manager import ConfigManager
 from audit_logger import AuditLogger
 from mira_pipeline_prod import get_engine
 
@@ -198,6 +235,7 @@ div[data-testid="stMarkdownContainer"] strong { color: var(--ink) !important; fo
 }
 .banner-approved { background: var(--teal-tint); border: 1px solid rgba(45,140,127,0.22); color: var(--teal-deep); }
 .banner-flagged  { background: var(--clay-tint); border: 1px solid rgba(201,80,31,0.22); color: var(--clay); }
+.banner-info     { background: var(--gold-tint); border: 1px solid rgba(185,138,46,0.25); color: var(--gold); }
 
 /* MONO BLOCK */
 .mono-block {
@@ -302,6 +340,46 @@ cfg, auth_manager, audit_logger, engine = load_services()
 
 
 # ══════════════════════════════════════════════════════════════════════════
+# SAFETY FLAG EXPLANATIONS — human-readable, shown instead of raw codes
+# ══════════════════════════════════════════════════════════════════════════
+
+def explain_safety_flag(flag: str) -> str:
+    if flag == "no_data":
+        return "No patient data was available to finalize."
+    if flag == "session_state_lost":
+        return "The audit session expired before this could be finalized."
+    if flag.startswith("id_mismatch:"):
+        ids = flag.split(":", 1)[1]
+        return f"Report referenced patient ID(s) not present in the retrieved data: {ids}"
+    return flag.replace("_", " ").capitalize()
+
+
+def status_banner_html(state: dict) -> str:
+    """Builds an honest, plain-language banner for data-quality states
+    surfaced by the pipeline (patient_not_found / no_data / broadened_query
+    / list_insufficient). Returns '' if nothing needs flagging."""
+    status = (state or {}).get("data_status", "")
+    if status == "patient_not_found":
+        missing = state.get("missing_patient_ids") or []
+        ids = ", ".join(str(i) for i in missing) if missing else "the requested ID"
+        return (f'<div class="banner banner-flagged"><span>▲</span>'
+                f'Patient {ids} was not found in the system. No unrelated patient '
+                f'data has been substituted.</div>')
+    if status == "no_data":
+        return ('<div class="banner banner-flagged"><span>▲</span>'
+                'No matching lab data was found for this query.</div>')
+    if status == "broadened_query":
+        return ('<div class="banner banner-info"><span>ℹ</span>'
+                'No exact match for your query — showing general abnormal findings '
+                'across patients instead. This is disclosed in the report below.</div>')
+    if status == "list_insufficient":
+        return ('<div class="banner banner-info"><span>ℹ</span>'
+                'This looked like a multi-patient question, but only a limited number '
+                'of patients matched even after broadening the search.</div>')
+    return ""
+
+
+# ══════════════════════════════════════════════════════════════════════════
 # SESSION STATE
 # ══════════════════════════════════════════════════════════════════════════
 
@@ -315,12 +393,30 @@ def init_session():
         "paused_state": None,
         "final_state": None,
         "show_feedback_box": False,
-            "active_tab": "audit",   # "audit" | "admin"
-            "pending_question": "",
+        "active_tab": "audit",   # "audit" | "admin"
+        "pending_question": "",
+        # FIX: separate, durable field — pending_question gets cleared once
+        # the run kicks off, but submit_human_decision needs the original
+        # question throughout the entire audit (approve, reject, revise).
+        "current_question": "",
     }
     for key, val in defaults.items():
         if key not in st.session_state:
             st.session_state[key] = val
+
+
+def reset_audit_session():
+    """Fully resets to a clean slate — used by the always-available
+    'New Audit' button and by 'Start a new audit' after completion.
+    Uses engine.start_new_audit() so no stale thread/state is reused."""
+    st.session_state.thread_config = engine.start_new_audit()
+    st.session_state.stage = "idle"
+    st.session_state.paused_state = None
+    st.session_state.final_state = None
+    st.session_state.pending_question = ""
+    st.session_state.current_question = ""
+    st.session_state.show_feedback_box = False
+    st.session_state.pop("feedback_box", None)
 
 
 # Call to initialise session state
@@ -555,6 +651,73 @@ def render_trend_chart(trend_json: str):
     return True
 
 
+def render_data_sources_expander(active: dict):
+    """The 'View data sources' panel — now also surfaces query intent and
+    patient existence detail so a clinician can see *why* the pipeline
+    made the choices it made, instead of a report appearing from nowhere."""
+    with st.expander("View data sources used"):
+        st.markdown('<div class="panel-eyebrow">SQL QUERY EXECUTED</div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="mono-block">{active.get("sql_query_used","—")}</div>', unsafe_allow_html=True)
+
+        intent = active.get("query_intent") or {}
+        if intent:
+            conditions = ", ".join(intent.get("conditions", [])) or "none detected"
+            list_flag = "yes" if intent.get("is_list") else "no"
+            st.markdown('<div class="panel-eyebrow" style="margin-top:16px;">QUERY INTERPRETATION</div>', unsafe_allow_html=True)
+            st.markdown(
+                f'<div style="font-size:13px;color:#5C7A89;">'
+                f'Interpreted as a multi-patient question: <strong style="color:#1C2B33;">{list_flag}</strong><br>'
+                f'Recognized clinical terms: <strong style="color:#1C2B33;">{conditions}</strong></div>',
+                unsafe_allow_html=True
+            )
+
+        requested = active.get("requested_patient_ids") or []
+        found = active.get("found_patient_ids") or []
+        missing = active.get("missing_patient_ids") or []
+        if requested or found:
+            st.markdown('<div class="panel-eyebrow" style="margin-top:16px;">PATIENT MATCH DETAIL</div>', unsafe_allow_html=True)
+            lines = []
+            if requested:
+                lines.append(f"Requested: {', '.join(str(i) for i in requested)}")
+            if found:
+                lines.append(f"Found: {', '.join(str(i) for i in found)}")
+            if missing:
+                lines.append(f"Not found: {', '.join(str(i) for i in missing)}")
+            st.markdown(f'<div style="font-size:13px;color:#5C7A89;">{"<br>".join(lines)}</div>',
+                        unsafe_allow_html=True)
+
+        if active.get("data_status") == "broadened_query":
+            st.markdown('<div class="panel-eyebrow" style="margin-top:16px;">NOTE</div>', unsafe_allow_html=True)
+            st.markdown(
+                '<div style="font-size:13px;color:#5C7A89;">No results matched the specific '
+                'criteria, so the search was broadened to general abnormal findings.</div>',
+                unsafe_allow_html=True
+            )
+
+        st.markdown('<div class="panel-eyebrow" style="margin-top:16px;">GUIDELINE SEARCH QUERY</div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="mono-block">{active.get("search_query_used","—")}</div>', unsafe_allow_html=True)
+
+        trend_json = active.get("trend_data", "")
+        if trend_json:
+            try:
+                tp = json.loads(trend_json)
+                st.markdown('<div class="panel-eyebrow" style="margin-top:16px;">LAB TRAJECTORY</div>', unsafe_allow_html=True)
+                st.markdown(f'<div style="font-size:13px;color:#5C7A89;">{tp.get("summary","")}</div>', unsafe_allow_html=True)
+            except Exception:
+                pass
+
+        try:
+            guidelines = json.loads(active.get("guidelines", "{}")).get("guidelines", [])
+            if guidelines:
+                st.markdown('<div class="panel-eyebrow" style="margin-top:16px;">GUIDELINES RETRIEVED</div>', unsafe_allow_html=True)
+                for g in guidelines:
+                    st.markdown(f'<div style="font-size:13px;color:#5C7A89;padding:4px 0;">'
+                                f'<strong style="color:#1C2B33;">{g["source"]}</strong> — {g["topic"]}</div>',
+                                unsafe_allow_html=True)
+        except Exception:
+            pass
+
+
 # ══════════════════════════════════════════════════════════════════════════
 # TAB 1 — CLINICAL AUDIT CONSOLE
 # ══════════════════════════════════════════════════════════════════════════
@@ -585,8 +748,20 @@ with tab_audit:
         st.write("")
 
         run_disabled = st.session_state.stage in ["running", "awaiting_review"] or not question.strip()
-        run_clicked = st.button("Run clinical audit", type="primary",
-                                use_container_width=True, disabled=run_disabled)
+        run_col, new_audit_col = st.columns([2, 1])
+        with run_col:
+            run_clicked = st.button("Run clinical audit", type="primary",
+                                    use_container_width=True, disabled=run_disabled)
+        with new_audit_col:
+            # FIX / NEW FEATURE: previously only available after a report was
+            # fully finalized. Now available at every stage — lets the
+            # clinician abort a stuck or unwanted audit and start clean
+            # without waiting for it to finish.
+            new_audit_clicked = st.button("New audit", use_container_width=True)
+
+        if new_audit_clicked:
+            reset_audit_session()
+            st.rerun()
 
         st.write("")
         render_fill_rail(
@@ -597,31 +772,7 @@ with tab_audit:
 
         if st.session_state.paused_state or st.session_state.final_state:
             active = st.session_state.final_state or st.session_state.paused_state
-            with st.expander("View data sources used"):
-                st.markdown('<div class="panel-eyebrow">SQL QUERY EXECUTED</div>', unsafe_allow_html=True)
-                st.markdown(f'<div class="mono-block">{active.get("sql_query_used","—")}</div>', unsafe_allow_html=True)
-                st.markdown('<div class="panel-eyebrow" style="margin-top:16px;">GUIDELINE SEARCH QUERY</div>', unsafe_allow_html=True)
-                st.markdown(f'<div class="mono-block">{active.get("search_query_used","—")}</div>', unsafe_allow_html=True)
-
-                trend_json = active.get("trend_data", "")
-                if trend_json:
-                    try:
-                        tp = json.loads(trend_json)
-                        st.markdown('<div class="panel-eyebrow" style="margin-top:16px;">LAB TRAJECTORY</div>', unsafe_allow_html=True)
-                        st.markdown(f'<div style="font-size:13px;color:#5C7A89;">{tp.get("summary","")}</div>', unsafe_allow_html=True)
-                    except Exception:
-                        pass
-
-                try:
-                    guidelines = json.loads(active.get("guidelines", "{}")).get("guidelines", [])
-                    if guidelines:
-                        st.markdown('<div class="panel-eyebrow" style="margin-top:16px;">GUIDELINES RETRIEVED</div>', unsafe_allow_html=True)
-                        for g in guidelines:
-                            st.markdown(f'<div style="font-size:13px;color:#5C7A89;padding:4px 0;">'
-                                        f'<strong style="color:#1C2B33;">{g["source"]}</strong> — {g["topic"]}</div>',
-                                        unsafe_allow_html=True)
-                except Exception:
-                    pass
+            render_data_sources_expander(active)
 
         # Sign-out button
         st.write("")
@@ -629,9 +780,7 @@ with tab_audit:
             audit_logger.log_logout(user.user_id, st.session_state.session_id)
             st.session_state.auth_token = ""
             st.session_state.auth_user  = None
-            st.session_state.stage      = "idle"
-            st.session_state.paused_state = None
-            st.session_state.final_state  = None
+            reset_audit_session()
             st.rerun()
 
     with right_col:
@@ -652,6 +801,11 @@ with tab_audit:
                 '<span class="eyebrow-dot" style="background:#B98A2E;"></span>'
                 'DRAFT — AWAITING YOUR REVIEW</div>', unsafe_allow_html=True
             )
+
+            banner = status_banner_html(state)
+            if banner:
+                st.markdown(banner, unsafe_allow_html=True)
+
             render_trend_chart(state.get("trend_data", ""))
             render_report_panel(state["clinical_reasoning"])
 
@@ -671,20 +825,41 @@ with tab_audit:
                     placeholder="e.g. Be more specific about units, add urgency level.",
                     key="feedback_box", label_visibility="visible"
                 )
-                if st.button("Send revision request", type="primary"):
+                send_col, cancel_col = st.columns(2)
+                with send_col:
+                    send_clicked = st.button(
+                        "Send revision request", type="primary",
+                        disabled=not feedback_text.strip()
+                    )
+                with cancel_col:
+                    cancel_clicked = st.button("Cancel")
+
+                if cancel_clicked:
+                    st.session_state.show_feedback_box = False
+                    st.session_state.pop("feedback_box", None)
+                    st.rerun()
+
+                if send_clicked:
                     ph = st.empty()
                     with ph.container():
                         render_processing_strip("Sending feedback to reasoning agent")
-                    final = engine.submit_human_decision(
-                        st.session_state.thread_config, "approve",
+                    # FIX: this used to send decision="approve" and never
+                    # passed the feedback text at all, so nothing was ever
+                    # actually revised. It now sends "reject" + the
+                    # clinician's feedback, and uses the durable
+                    # current_question rather than the already-cleared
+                    # pending_question.
+                    revised = engine.submit_human_decision(
+                        st.session_state.thread_config, "reject",
+                        feedback=feedback_text.strip(),
                         user_id=user.user_id, hospital_id=user.hospital_id,
-                        clinical_question=st.session_state.get("pending_question") or "",
+                        clinical_question=st.session_state.get("current_question") or "",
                         paused_state=st.session_state.paused_state,
-                        
                     )
                     ph.empty()
-                    st.session_state.paused_state = final
+                    st.session_state.paused_state = revised
                     st.session_state.show_feedback_box = False
+                    st.session_state.pop("feedback_box", None)
                     st.rerun()
 
             if approve_clicked:
@@ -694,7 +869,8 @@ with tab_audit:
                 final = engine.submit_human_decision(
                     st.session_state.thread_config, "approve",
                     user_id=user.user_id, hospital_id=user.hospital_id,
-                    clinical_question=st.session_state.get("pending_question") or ""
+                    clinical_question=st.session_state.get("current_question") or "",
+                    paused_state=st.session_state.paused_state,
                 )
                 ph.empty()
                 st.session_state.final_state = final
@@ -703,13 +879,19 @@ with tab_audit:
 
         elif st.session_state.stage == "complete":
             state = st.session_state.final_state
+
+            banner = status_banner_html(state)
+            if banner:
+                st.markdown(banner, unsafe_allow_html=True)
+
             if state.get("approved"):
                 st.markdown('<div class="banner banner-approved"><span>✓</span>'
                             'Cleared by safety review — all claims grounded in retrieved data</div>',
                             unsafe_allow_html=True)
             else:
-                flags = ", ".join(state.get("safety_flags", [])) or "Review recommended"
-                st.markdown(f'<div class="banner banner-flagged"><span>▲</span>Flagged — {flags}</div>',
+                flags = state.get("safety_flags", [])
+                explained = "; ".join(explain_safety_flag(f) for f in flags) or "Review recommended"
+                st.markdown(f'<div class="banner banner-flagged"><span>▲</span>Flagged — {explained}</div>',
                             unsafe_allow_html=True)
 
             st.markdown('<div class="panel-eyebrow with-dot"><span class="eyebrow-dot"></span>FINAL CLINICAL REPORT</div>',
@@ -718,10 +900,7 @@ with tab_audit:
             render_report_panel(state.get("final_report", "No report generated."))
 
             if st.button("Start a new audit"):
-                st.session_state.stage = "idle"
-                st.session_state.paused_state = None
-                st.session_state.final_state  = None
-                st.session_state.thread_config = None
+                reset_audit_session()
                 st.rerun()
 
     # ══════════════════════════════════════════════════════════════════════
@@ -730,6 +909,10 @@ with tab_audit:
 
     if run_clicked and question.strip() and st.session_state.stage == "idle":
         st.session_state.pending_question = question.strip()
+        # FIX: keep the original question in a field that survives the
+        # rest of the audit lifecycle (pending_question gets cleared below
+        # once the run starts).
+        st.session_state.current_question = question.strip()
         st.session_state.stage = "running"
         st.rerun()
 
@@ -741,7 +924,7 @@ with tab_audit:
                 render_processing_strip("Querying patient database")
                 st.markdown('</div>', unsafe_allow_html=True)
 
-            st.session_state.thread_config = engine.new_thread()
+            st.session_state.thread_config = engine.start_new_audit()
             paused = engine.run_until_review(
                 st.session_state.pending_question,
                 st.session_state.thread_config,

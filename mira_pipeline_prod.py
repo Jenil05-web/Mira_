@@ -1,21 +1,74 @@
 """
 mira_pipeline_prod.py
 ======================
-MIRA Production Pipeline.
+MIRA Production Pipeline — ENHANCED.
 
-DROP-IN REPLACEMENT for mira_pipeline.py with:
-  - ConfigManager    → secrets from GCP / env / .env
-  - DBAdapter        → schema-agnostic SQL (SQLite dev → Supabase prod)
-  - FHIRAdapter      → plug-and-play hospital EHR connection
-  - AuditLogger      → HIPAA append-only trail on every agent call
-  - PostgresSaver    → persistent LangGraph checkpoints (Supabase)
-  - pgvector search  → replaces local FAISS when Supabase is configured
-  - MemorySaver      → automatic fallback when Supabase not configured
+DROP-IN REPLACEMENT for the previous mira_pipeline_prod.py. Same public API
+(get_engine, MIRAEngineProd, run_until_review, submit_human_decision,
+new_thread, get_current_state) — your Streamlit app does not need to change
+its calling conventions, though a couple of new optional helpers are added
+(see "NEW PUBLIC API" near the bottom).
+
+WHAT WAS FIXED IN THIS VERSION
+-------------------------------
+1. REVISION NOT WORKING
+   The old code computed a revised report on "reject" but never wrote it
+   back into the LangGraph checkpoint (`graph.update_state`). Any later
+   read of state (e.g. a page rerun calling get_current_state) saw the
+   stale pre-revision report. Fixed: every revision path now persists via
+   `graph.update_state(...)` and returns the checkpoint's own values, so
+   what you see is guaranteed to be what's stored.
+
+2. "NA, no patient found" -> THEN A RANDOM UNRELATED PATIENT REPORT
+   The old SQL agent silently swapped in an unrelated generic "abnormal
+   patients" query when a specifically-requested patient ID had no rows,
+   and then wrote a full report as if that unrelated patient was the one
+   asked about. Fixed: we now (a) explicitly check whether the patient
+   exists at all, (b) never blend an unrelated patient into a
+   single-patient answer, and (c) if we do have to broaden a *list* query,
+   we tag that fact in the state so the report says so honestly instead
+   of pretending it's an exact match.
+
+3. SINGLE RESULT FOR PLURAL QUESTIONS ("which patients show signs of AKI")
+   `should_retry_sql` always returned "ok", so the retry edge in the graph
+   was dead code. Fixed: a real intent parser detects list-style questions
+   ("patients", "which patients", "list", "how many", multiple IDs) and a
+   working retry loop broadens the query (up to MAX_SQL_RETRIES times)
+   until enough distinct patients are found or retries are exhausted —
+   and if genuinely only one patient qualifies, the report says so
+   explicitly instead of silently acting like nothing was wrong.
+
+4. APPROVE FINALIZING A FABRICATED REPORT WHEN THERE WAS NO DATA
+   The MemorySaver-lost-state recovery path trusted a frontend-supplied
+   `paused_state` blindly, even if it belonged to a *different* question
+   (a classic stale-cache bug). Fixed: that recovery path now checks the
+   `clinical_question` actually matches before reusing anything, and the
+   no-data guard runs before any report can be marked approved.
+
+5. NO CLINICAL VOCABULARY / "COMMON SENSE"
+   Added a CONDITION_VOCAB dictionary (AKI, sepsis, hyperkalemia,
+   hypokalemia, anemia, hyperglycemia, hypoglycemia, hypoxia, liver
+   injury, thrombocytopenia, leukocytosis) that gets folded into both the
+   SQL-generation prompt and the semantic search query whenever the
+   question mentions (or implies) one of these, so vague, real-world
+   phrasing ("signs of AKI", "is this patient septic?") maps to the right
+   labs without the user having to spell out lab names.
+
+6. HALLUCINATION / MISMATCH GUARD
+   The critic agent now cross-checks patient IDs mentioned in the final
+   report against patient IDs actually present in the SQL results, and
+   flags (rather than silently ships) any mismatch.
+
+7. "START NEW AUDIT" SUPPORT
+   Added `start_new_audit()` — returns a brand-new thread config and does
+   not reuse any cached per-thread state, so a "New Audit" button in your
+   UI has a clean, single-call way to reset. (See NEW PUBLIC API below —
+   this is a backend hook; wiring an actual button is a one-line change in
+   your Streamlit file, shown in the docstring for that method.)
 
 BACKWARDS COMPATIBLE:
   If no Supabase credentials are set, the pipeline behaves exactly like
-  the original mira_pipeline.py — SQLite + FAISS + MemorySaver.
-  Adding Supabase credentials upgrades all three automatically.
+  before — SQLite + FAISS + MemorySaver.
 
 INSTALL (production extras beyond base requirements):
   pip install sqlalchemy psycopg2-binary langgraph-checkpoint-postgres
@@ -25,6 +78,7 @@ import json
 import logging
 import os
 import pickle
+import re
 import sqlite3
 import time
 import uuid
@@ -51,6 +105,157 @@ from trend_agent import TrendAgent
 
 logger = logging.getLogger(__name__)
 
+MAX_SQL_RETRIES = 2          # how many times we'll broaden a list query
+MIN_LIST_PATIENTS = 2        # below this, a "plural" question is treated as under-served
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# CLINICAL VOCABULARY — maps common real-world phrasing to lab hints
+# ══════════════════════════════════════════════════════════════════════════
+
+CONDITION_VOCAB: dict[str, dict] = {
+    "aki": {
+        "aliases": ["aki", "acute kidney injury", "kidney injury", "renal failure", "renal injury"],
+        "sql_hint": (
+            "For acute kidney injury (AKI): look at creatinine "
+            "(d.label ILIKE '%creatinine%') where valuenum is elevated above "
+            "ref_range_upper, and/or BUN (d.label ILIKE '%urea nitrogen%' OR "
+            "d.label ILIKE '%bun%'). A rising creatinine trend is the strongest signal."
+        ),
+        "search_terms": "acute kidney injury creatinine elevation diagnostic criteria staging",
+    },
+    "sepsis": {
+        "aliases": ["sepsis", "septic", "septicemia"],
+        "sql_hint": (
+            "For sepsis concerns: look at lactate (d.label ILIKE '%lactate%') elevated "
+            "above ref_range_upper, WBC (d.label ILIKE '%white blood cell%' OR "
+            "d.label ILIKE '%wbc%') abnormal high or low, and any temperature/vitals labs present."
+        ),
+        "search_terms": "sepsis criteria lactate elevated white blood cell abnormal",
+    },
+    "hyperkalemia": {
+        "aliases": ["hyperkalemia", "high potassium", "elevated potassium"],
+        "sql_hint": "For hyperkalemia: d.label ILIKE '%potassium%' AND l.valuenum > l.ref_range_upper.",
+        "search_terms": "hyperkalemia elevated potassium management",
+    },
+    "hypokalemia": {
+        "aliases": ["hypokalemia", "low potassium"],
+        "sql_hint": "For hypokalemia: d.label ILIKE '%potassium%' AND l.valuenum < l.ref_range_lower.",
+        "search_terms": "hypokalemia low potassium management",
+    },
+    "anemia": {
+        "aliases": ["anemia", "anaemia", "low hemoglobin", "low hematocrit"],
+        "sql_hint": (
+            "For anemia: d.label ILIKE '%hemoglobin%' OR d.label ILIKE '%hematocrit%', "
+            "with valuenum < ref_range_lower."
+        ),
+        "search_terms": "anemia low hemoglobin hematocrit workup",
+    },
+    "hyperglycemia": {
+        "aliases": ["hyperglycemia", "high glucose", "high blood sugar"],
+        "sql_hint": "For hyperglycemia: d.label ILIKE '%glucose%' AND l.valuenum > l.ref_range_upper.",
+        "search_terms": "hyperglycemia elevated glucose management",
+    },
+    "hypoglycemia": {
+        "aliases": ["hypoglycemia", "low glucose", "low blood sugar"],
+        "sql_hint": "For hypoglycemia: d.label ILIKE '%glucose%' AND l.valuenum < l.ref_range_lower.",
+        "search_terms": "hypoglycemia low glucose management",
+    },
+    "hypoxia": {
+        "aliases": ["hypoxia", "hypoxemia", "low oxygen"],
+        "sql_hint": "For hypoxia: d.label ILIKE '%oxygen%' OR d.label ILIKE '%pao2%' OR d.label ILIKE '%sao2%', with low valuenum.",
+        "search_terms": "hypoxia low oxygen saturation management",
+    },
+    "liver injury": {
+        "aliases": ["liver injury", "hepatic injury", "liver failure", "hepatic failure"],
+        "sql_hint": (
+            "For liver injury: d.label ILIKE '%bilirubin%' OR d.label ILIKE '%alt%' OR "
+            "d.label ILIKE '%ast%', with valuenum > ref_range_upper."
+        ),
+        "search_terms": "liver injury elevated bilirubin transaminase",
+    },
+    "thrombocytopenia": {
+        "aliases": ["thrombocytopenia", "low platelets"],
+        "sql_hint": "For thrombocytopenia: d.label ILIKE '%platelet%' AND l.valuenum < l.ref_range_lower.",
+        "search_terms": "thrombocytopenia low platelet count causes",
+    },
+    "leukocytosis": {
+        "aliases": ["leukocytosis", "high white blood cell", "high wbc"],
+        "sql_hint": "For leukocytosis: d.label ILIKE '%white blood cell%' AND l.valuenum > l.ref_range_upper.",
+        "search_terms": "leukocytosis elevated white blood cell count causes",
+    },
+}
+
+LIST_INTENT_PHRASES = [
+    "which patients", "list of patients", "list patients", "all patients",
+    "how many patients", "every patient", "show me patients", "show patients",
+    "patients who", "patients with", "patients show", "patients showing",
+]
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# INTENT PARSER — turns free-form questions into structured hints
+# ══════════════════════════════════════════════════════════════════════════
+
+def parse_clinical_intent(question: str) -> dict:
+    """
+    Lightweight NLU: extracts patient ID(s), list-vs-single intent, and any
+    recognized clinical conditions, so downstream agents don't need the
+    user to spell out exact lab names or phrasing.
+    """
+    q = (question or "").lower()
+
+    # ---- Patient ID extraction (supports single or multiple IDs) ----
+    id_block_match = re.search(
+        r"patients?\s*(?:id[s]?)?\s*[:#]?\s*((?:\d{2,}\s*(?:,|and|&)?\s*)+)", q
+    )
+    patient_ids: list[int] = []
+    if id_block_match:
+        patient_ids = [int(x) for x in re.findall(r"\d{2,}", id_block_match.group(1))]
+
+    # ---- List vs single-patient intent ----
+    has_plural_word = bool(re.search(r"\bpatients\b", q))
+    has_list_phrase = any(p in q for p in LIST_INTENT_PHRASES)
+    is_list = (has_list_phrase or (has_plural_word and len(patient_ids) != 1) or len(patient_ids) > 1)
+    # If exactly one ID was named explicitly, that overrides "list" framing —
+    # the user wants that one patient, even if they said "patient's" etc.
+    if len(patient_ids) == 1 and not has_list_phrase:
+        is_list = False
+
+    # ---- Condition vocabulary matching ----
+    matched_conditions = []
+    for key, entry in CONDITION_VOCAB.items():
+        if any(alias in q for alias in entry["aliases"]):
+            matched_conditions.append(key)
+
+    return {
+        "raw_question": question,
+        "patient_ids": patient_ids,
+        "is_list": is_list,
+        "conditions": matched_conditions,
+    }
+
+
+def _condition_sql_hints(conditions: list[str]) -> str:
+    if not conditions:
+        return ""
+    lines = [CONDITION_VOCAB[c]["sql_hint"] for c in conditions if c in CONDITION_VOCAB]
+    return "\n".join(lines)
+
+
+def _condition_search_terms(conditions: list[str]) -> str:
+    if not conditions:
+        return ""
+    return " ".join(CONDITION_VOCAB[c]["search_terms"] for c in conditions if c in CONDITION_VOCAB)
+
+
+def _distinct_patient_ids(sql_result_json: str) -> set:
+    try:
+        rows = json.loads(sql_result_json).get("rows", [])
+        return {r["subject_id"] for r in rows if r.get("subject_id") is not None}
+    except Exception:
+        return set()
+
 
 # ══════════════════════════════════════════════════════════════════════════
 # STATE
@@ -75,6 +280,12 @@ class MIRAState(TypedDict):
     user_id:            str
     hospital_id:        str
     session_id:         str
+    # NEW — intent + data-quality tracking
+    query_intent:        dict
+    data_status:         str   # "ok" | "patient_not_found" | "no_data" | "broadened_query"
+    requested_patient_ids: list
+    found_patient_ids:     list
+    missing_patient_ids:   list
 
 
 def make_initial_state(clinical_question: str,
@@ -91,6 +302,11 @@ def make_initial_state(clinical_question: str,
         "user_id": user_id,
         "hospital_id": hospital_id,
         "session_id": session_id or str(uuid.uuid4()),
+        "query_intent": {},
+        "data_status": "",
+        "requested_patient_ids": [],
+        "found_patient_ids": [],
+        "missing_patient_ids": [],
     }
 
 
@@ -305,35 +521,101 @@ class MIRAEngineProd:
         except Exception:
             return guidelines_json
 
-    # ── Agent 1 — SQL Data Extractor ─────────────────────────────────────
-    def agent1_sql_extractor(self, state: MIRAState) -> MIRAState:
-        hospital_id = state.get("hospital_id", "default")
+    # ── Patient existence check (used to avoid the "random patient" bug) ──
+    def _check_patients_exist(self, patient_ids: list[int], hospital_id: str) -> tuple[list, list]:
+        """Returns (found_ids, missing_ids) by checking the patients table directly."""
+        found, missing = [], []
+        for pid in patient_ids:
+            try:
+                sql = f"SELECT subject_id FROM patients WHERE subject_id = {int(pid)} LIMIT 1"
+                result = self.sql_query_tool.invoke({"query": sql, "hospital_id": hospital_id})
+                rows = json.loads(result).get("rows", [])
+                (found if rows else missing).append(pid)
+            except Exception:
+                missing.append(pid)
+        return found, missing
+
+    # ── SQL sub-handler: one or more SPECIFIC patient IDs requested ───────
+    def _handle_specific_patient_query(self, state: MIRAState, intent: dict,
+                                        hospital_id: str) -> MIRAState:
+        patient_ids = intent["patient_ids"]
+        found_ids, missing_ids = self._check_patients_exist(patient_ids, hospital_id)
+
+        if not found_ids:
+            # FIX: previously this silently fell back to an unrelated broad
+            # query and reported on a random different patient. Now we say
+            # plainly that the requested patient(s) weren't found — no
+            # unrelated data is substituted.
+            empty_result = json.dumps({
+                "rows": [],
+                "requested_patient_ids": patient_ids,
+                "found_patient_ids": [],
+                "missing_patient_ids": missing_ids,
+            })
+            self.audit.log_agent_run("sql_extractor", state.get("session_id", ""),
+                                     0, True, rows_returned=0,
+                                     user_id=state.get("user_id", ""), hospital_id=hospital_id)
+            return {**state,
+                    "sql_query_used": f"-- patient existence check for {patient_ids} --",
+                    "sql_result": empty_result,
+                    "sql_error": "", "sql_retry_count": state.get("sql_retry_count", 0),
+                    "data_status": "patient_not_found",
+                    "requested_patient_ids": patient_ids,
+                    "found_patient_ids": [],
+                    "missing_patient_ids": missing_ids}
+
+        ids_csv = ",".join(str(int(p)) for p in found_ids)
+        sql = f"""
+            SELECT p.subject_id, p.gender, p.anchor_age,
+                   d.label AS lab_name, l.valuenum, l.valueuom,
+                   l.ref_range_lower, l.ref_range_upper, l.flag, l.charttime
+            FROM labevents l
+            JOIN patients p ON l.subject_id = p.subject_id
+            JOIN d_labitems d ON l.itemid = d.itemid
+            WHERE p.subject_id IN ({ids_csv})
+              AND l.valuenum IS NOT NULL
+            ORDER BY p.subject_id, l.charttime DESC
+            LIMIT 200
+        """
+        start = time.monotonic()
+        result = self.sql_query_tool.invoke({"query": sql, "hospital_id": hospital_id})
+        parsed = json.loads(result) if not json.loads(result).get("error") else {"rows": []}
+        rows = parsed.get("rows", [])
+        duration = int((time.monotonic() - start) * 1000)
+
+        data_status = "ok" if rows else "no_data"  # patient exists but no lab rows
+        enriched = json.dumps({
+            "rows": rows,
+            "requested_patient_ids": patient_ids,
+            "found_patient_ids": found_ids,
+            "missing_patient_ids": missing_ids,
+        }, default=str)
+
+        self.audit.log_agent_run("sql_extractor", state.get("session_id", ""),
+                                 duration, True, rows_returned=len(rows),
+                                 user_id=state.get("user_id", ""), hospital_id=hospital_id)
+        self.audit.log_data_access("sql", "lab_observations", len(rows),
+                                   state.get("session_id", ""),
+                                   state.get("user_id", ""), hospital_id)
+
+        return {**state, "sql_query_used": sql, "sql_result": enriched,
+                "sql_error": "", "sql_retry_count": state.get("sql_retry_count", 0),
+                "data_status": data_status,
+                "requested_patient_ids": patient_ids,
+                "found_patient_ids": found_ids,
+                "missing_patient_ids": missing_ids}
+
+    # ── SQL sub-handler: general / list-style question ─────────────────────
+    def _handle_general_query(self, state: MIRAState, intent: dict,
+                               hospital_id: str, schema: str) -> MIRAState:
+        question = intent["raw_question"]
         retry_count = state.get("sql_retry_count", 0)
-        question = state.get("clinical_question", "") or state.get("question", "") or ""
+        conditions = intent.get("conditions", [])
+        condition_hints = _condition_sql_hints(conditions)
 
-        # Detect if this is a direct patient ID query (e.g., "patient 10003045" or "details of patient 10003045")
-        import re
-        patient_id_match = re.search(r'patient\s*(\d+)', question, re.IGNORECASE)
-        
-        # If specific patient ID mentioned, use targeted query first
-        if patient_id_match:
-            patient_id = patient_id_match.group(1)
-            specific_patient_sql = f"""
-                SELECT p.subject_id, p.gender, p.anchor_age,
-                       d.label AS lab_name, l.valuenum, l.valueuom,
-                       l.ref_range_lower, l.ref_range_upper, l.flag, l.charttime
-                FROM labevents l
-                JOIN patients p ON l.subject_id = p.subject_id
-                JOIN d_labitems d ON l.itemid = d.itemid
-                WHERE p.subject_id = {patient_id}
-                  AND l.valuenum IS NOT NULL
-                ORDER BY l.charttime DESC
-                LIMIT 100
-            """
-        else:
-            specific_patient_sql = None
-
-        # Default broad base query — guaranteed to return data
+        # Base fallback — only used if the LLM-generated query errors or
+        # returns literally nothing. Tagged explicitly as a broadened/
+        # fallback result so the report can say so honestly.
         base_sql = """
             SELECT p.subject_id, p.gender, p.anchor_age,
                    d.label AS lab_name, l.valuenum, l.valueuom,
@@ -349,26 +631,33 @@ class MIRAEngineProd:
               )
               AND l.subject_id IN (
                   SELECT DISTINCT subject_id FROM labevents
-                  WHERE valuenum IS NOT NULL LIMIT 20
+                  WHERE valuenum IS NOT NULL LIMIT 30
               )
             ORDER BY p.subject_id, l.charttime DESC
-            LIMIT 50
+            LIMIT 60
         """
 
-        schema = self._schema_for(hospital_id)
+        broaden_note = ""
+        if retry_count > 0:
+            broaden_note = (
+                f"\nRETRY {retry_count}: your previous query returned too few distinct "
+                "patients for this plural/list question. Remove restrictive filters, "
+                "widen the abnormal threshold, and increase the patient pool so that "
+                "at least 10 different subject_ids can appear."
+            )
 
         system_prompt = f"""You are a medical SQL expert. Write a single valid PostgreSQL SELECT query.
-Always be flexible and common-sense in understanding the question.
-If a specific patient ID is mentioned, prioritize that patient's data.
+Always be flexible and common-sense in understanding the question, including vague or
+colloquially-phrased clinical questions.
 
 DATABASE SCHEMA:
 {schema}
 
 VOCABULARY:
-- "critical"/"severe" → valuenum > ref_range_upper * 1.5 OR valuenum < ref_range_lower * 0.5 OR flag IS NOT NULL
-- "abnormal" → valuenum > ref_range_upper OR valuenum < ref_range_lower OR flag IS NOT NULL
-- "high"/"elevated" → valuenum > ref_range_upper
-- "low" → valuenum < ref_range_lower
+- "critical"/"severe" -> valuenum > ref_range_upper * 1.5 OR valuenum < ref_range_lower * 0.5 OR flag IS NOT NULL
+- "abnormal" -> valuenum > ref_range_upper OR valuenum < ref_range_lower OR flag IS NOT NULL
+- "high"/"elevated" -> valuenum > ref_range_upper
+- "low" -> valuenum < ref_range_lower
 - For lab names use LIKE e.g. d.label ILIKE '%creatinine%'
 - ALWAYS include: p.subject_id, p.gender, p.anchor_age, d.label AS lab_name,
   l.valuenum, l.valueuom, l.ref_range_lower, l.ref_range_upper, l.flag, l.charttime
@@ -376,46 +665,47 @@ VOCABULARY:
 - Always JOIN patients p ON l.subject_id = p.subject_id
 - Use table aliases: labevents l, patients p, d_labitems d
 - WHERE l.valuenum IS NOT NULL always
-- When a specific patient ID is mentioned, return ALL their lab data (no abnormal filter needed)
-- CRITICAL: When asked for a LIST of patients, your query MUST return multiple subject_ids. Use IN or GROUP BY or subqueries to ensure data from at least 10 different patients is returned. Never write a query that can return only one subject_id.
-- LIMIT 50 minimum when returning lists. For single patient queries, LIMIT 100.
-- Return ONLY raw SQL, no markdown, no explanation"""
+{condition_hints}
+- CRITICAL: When asked for a LIST of patients ("which patients...", "patients with...",
+  "how many patients..."), your query MUST return multiple subject_ids. Use IN, GROUP BY,
+  or subqueries to ensure data from at least 10 different patients is returned whenever
+  the underlying data supports it. Never write a query that can return only one subject_id
+  for a plural question.
+- LIMIT 60 minimum when returning lists.
+- Return ONLY raw SQL, no markdown, no explanation.{broaden_note}"""
 
         start = time.monotonic()
-        
-        # Try specific patient query first if detected
-        result = None
-        raw_sql = None
-        if specific_patient_sql:
-            result = self.sql_query_tool.invoke({"query": specific_patient_sql, "hospital_id": hospital_id})
-            parsed = json.loads(result)
-            rows = parsed.get("rows", [])
-            if rows and "error" not in parsed:
-                raw_sql = specific_patient_sql
-            else:
-                result = None
-        
-        # If specific patient query failed or not attempted, generate SQL from LLM
-        if result is None:
-            response = self.llm.invoke([
-                SystemMessage(content=system_prompt),
-                HumanMessage(content=f"Clinical question: {question}")
-            ])
-            raw_sql = response.content.strip().replace("```sql", "").replace("```", "").strip()
-            result = self.sql_query_tool.invoke({"query": raw_sql, "hospital_id": hospital_id})
-        
+        response = self.llm.invoke([
+            SystemMessage(content=system_prompt),
+            HumanMessage(content=f"Clinical question: {question}")
+        ])
+        raw_sql = response.content.strip().replace("```sql", "").replace("```", "").strip()
+        result = self.sql_query_tool.invoke({"query": raw_sql, "hospital_id": hospital_id})
         parsed = json.loads(result)
         rows = parsed.get("rows", [])
+        used_fallback = False
 
-        # If error or 0 rows — try base query as fallback
         if "error" in parsed or len(rows) == 0:
-            print(f"Generated SQL returned 0 rows or error. Trying base fallback query.")
+            logger.info("Generated SQL returned 0 rows or error; using broad fallback query.")
             result = self.sql_query_tool.invoke({"query": base_sql, "hospital_id": hospital_id})
             parsed = json.loads(result)
             rows = parsed.get("rows", [])
             raw_sql = base_sql
+            used_fallback = True
 
         duration = int((time.monotonic() - start) * 1000)
+        distinct_patients = {r.get("subject_id") for r in rows if r.get("subject_id") is not None}
+
+        data_status = "broadened_query" if used_fallback else "ok"
+        if intent["is_list"] and len(distinct_patients) < MIN_LIST_PATIENTS:
+            data_status = "list_insufficient"
+        if len(rows) == 0:
+            data_status = "no_data"
+
+        enriched = json.dumps({
+            "rows": rows,
+            "used_fallback_broad_query": used_fallback,
+        }, default=str)
 
         self.audit.log_agent_run("sql_extractor", state.get("session_id", ""),
                                  duration, True, rows_returned=len(rows),
@@ -425,12 +715,44 @@ VOCABULARY:
                                    state.get("session_id", ""),
                                    state.get("user_id", ""), hospital_id)
 
-        return {**state, "sql_query_used": raw_sql, "sql_result": result,
-                "sql_error": "", "sql_retry_count": retry_count}
+        return {**state, "sql_query_used": raw_sql, "sql_result": enriched,
+                "sql_error": "", "sql_retry_count": retry_count,
+                "data_status": data_status,
+                "requested_patient_ids": [], "found_patient_ids": list(distinct_patients),
+                "missing_patient_ids": []}
+
+    # ── Agent 1 — SQL Data Extractor (dispatcher) ────────────────────────
+    def agent1_sql_extractor(self, state: MIRAState) -> MIRAState:
+        hospital_id = state.get("hospital_id", "default")
+        question = state.get("clinical_question", "") or state.get("question", "") or ""
+
+        # Preserve intent across retries so we don't re-parse every loop.
+        intent = state.get("query_intent") or parse_clinical_intent(question)
+        state = {**state, "query_intent": intent}
+
+        if intent["patient_ids"] and state.get("sql_retry_count", 0) == 0:
+            return self._handle_specific_patient_query(state, intent, hospital_id)
+
+        schema = self._schema_for(hospital_id)
+        return self._handle_general_query(state, intent, hospital_id, schema)
 
     def should_retry_sql(self, state: MIRAState) -> str:
-        # No more retry loop needed — fallback handles it inline above
-        return "ok"
+        # FIX: this used to be a stub that always returned "ok", so the
+        # retry edge in the graph was dead code. Now it actually broadens
+        # list-style queries that came back with too few distinct patients.
+        intent = state.get("query_intent", {})
+        retry_count = state.get("sql_retry_count", 0)
+        if not intent.get("is_list"):
+            return "ok"
+        if state.get("data_status") != "list_insufficient":
+            return "ok"
+        if retry_count >= MAX_SQL_RETRIES:
+            return "ok"
+        return "retry"
+
+    # (called by the "retry" edge before looping back into sql_extractor)
+    def _increment_retry(self, state: MIRAState) -> MIRAState:
+        return {**state, "sql_retry_count": state.get("sql_retry_count", 0) + 1}
 
     # ── Agent 1.5 — Trend Check ──────────────────────────────────────────
     def agent_trend_check(self, state: MIRAState) -> MIRAState:
@@ -469,8 +791,9 @@ VOCABULARY:
     def agent2_semantic_crossref(self, state: MIRAState) -> MIRAState:
         sql_context = state.get("sql_result", "") or "No patient data retrieved."
         hospital_id = state.get("hospital_id", "global")
-
         question = state.get("clinical_question", "") or state.get("question", "") or ""
+        intent = state.get("query_intent", {})
+        condition_terms = _condition_search_terms(intent.get("conditions", []))
 
         response = self.llm.invoke([
             SystemMessage(content=(
@@ -482,6 +805,8 @@ VOCABULARY:
                                   f"Patient data: {sql_context[:1000]}")
         ])
         search_query = response.content.strip()
+        if condition_terms:
+            search_query = f"{search_query} {condition_terms}".strip()
 
         guidelines_result = self.vector_search_tool.invoke({
             "query": search_query, "k": 3, "hospital_id": hospital_id
@@ -506,32 +831,69 @@ VOCABULARY:
     def agent3_clinical_reasoning(self, state: MIRAState) -> MIRAState:
         sql_result = state.get("sql_result", "No patient data.")
         guideline_text = self._build_guideline_text(state.get("guidelines", ""))
+        intent = state.get("query_intent", {})
+        data_status = state.get("data_status", "")
 
-        # Count unique patients in result
-        unique_patients = set()
         try:
-            rows = json.loads(sql_result).get("rows", [])
-            for row in rows:
-                if "subject_id" in row:
-                    unique_patients.add(row["subject_id"])
+            parsed_sql = json.loads(sql_result)
+            rows = parsed_sql.get("rows", [])
         except Exception:
-            rows = []
-        
-        patient_count_note = ""
-        if len(unique_patients) == 1:
-            patient_count_note = ("\n\nNOTE: Only ONE patient matched the criteria. "
-                                 "The analysis below refers to a single patient case.")
-        elif len(unique_patients) == 0:
-            patient_count_note = "\n\nWARNING: No patients found matching the query criteria."
+            parsed_sql, rows = {}, []
+
+        unique_patients = {r["subject_id"] for r in rows if r.get("subject_id") is not None}
+
+        # ---- Build an honest, specific status note for the model ----
+        status_note = ""
+        if data_status == "patient_not_found":
+            missing = state.get("missing_patient_ids") or parsed_sql.get("missing_patient_ids", [])
+            status_note = (
+                f"\n\nDATA STATUS: The requested patient ID(s) {missing} were NOT found in the "
+                "system. Do not invent or substitute a different patient. State plainly that "
+                "no matching patient exists and suggest the user double-check the ID."
+            )
+        elif data_status == "no_data":
+            status_note = (
+                "\n\nDATA STATUS: The patient(s)/criteria in question exist but no matching lab "
+                "data was found. State plainly that no relevant lab results are on record — do "
+                "not fabricate findings."
+            )
+        elif data_status == "broadened_query":
+            status_note = (
+                "\n\nDATA STATUS: No results matched the specific criteria in the question, so "
+                "the system broadened the search to general abnormal findings across patients. "
+                "You MUST clearly disclose this to the reader at the top of the report (e.g. "
+                "'No exact match for your query; showing general abnormal findings instead') — "
+                "never present broadened results as if they were an exact match."
+            )
+        elif data_status == "list_insufficient" and intent.get("is_list"):
+            status_note = (
+                f"\n\nDATA STATUS: This is a list-style question, but only {len(unique_patients)} "
+                "patient(s) matched after broadening the search as far as reasonably possible. "
+                "State the actual count plainly — do not imply a larger cohort than what was found."
+            )
+
+        if intent.get("is_list") and len(unique_patients) == 1 and data_status not in (
+            "patient_not_found", "no_data"
+        ):
+            status_note += (
+                "\n\nNOTE: The question asked about multiple patients, but only ONE patient "
+                "actually matched the criteria. Say this explicitly, e.g. 'Only one patient "
+                "matched this criteria: Patient [ID].' Do not treat it as a data error."
+            )
+        elif len(unique_patients) == 1:
+            status_note += (
+                "\n\nNOTE: Only ONE patient matched the criteria. "
+                "The analysis below refers to a single patient case."
+            )
+        elif len(unique_patients) == 0 and data_status not in ("patient_not_found",):
+            status_note += "\n\nWARNING: No patients found matching the query criteria."
 
         trend_context = ""
         try:
             td = state.get("trend_data", "")
             if td:
                 trend_parsed = json.loads(td)
-                trend_context = (
-                    f"\n\nLAB TRAJECTORY:\n{trend_parsed.get('summary', '')}"
-                )
+                trend_context = f"\n\nLAB TRAJECTORY:\n{trend_parsed.get('summary', '')}"
         except Exception:
             pass
 
@@ -548,7 +910,9 @@ VOCABULARY:
         feedback_context = ""
         if state.get("human_decision") == "reject" and state.get("human_feedback"):
             feedback_context = (
-                f"\n\nCLINICIAN FEEDBACK (revise accordingly):\n{state['human_feedback']}"
+                f"\n\nCLINICIAN FEEDBACK (you MUST revise the report to address this, and the "
+                f"revision must be substantively different from the previous draft):\n"
+                f"{state['human_feedback']}"
             )
 
         system_prompt = f"""You are an expert clinical AI assistant. Write a professional, well-structured clinical report.
@@ -567,13 +931,18 @@ Format your response EXACTLY as:
 [Specific, actionable recommendations]
 
 IMPORTANT GUIDELINES:
-- Use proper medical terminology and professional tone
-- Ground every number, lab value, and ID in the provided data — never hallucinate
-- For list queries: if multiple patients, format as "1. Patient ID [ID], [demographics], [key finding]\n2. Patient ID..." etc
-- If only ONE patient: explicitly state this is a single-patient analysis
-- If NO data: clearly state "No patients matched the query criteria"
-- Use markdown formatting for readability
-- Be concise but complete{patient_count_note}{trend_context}{relevance_warning}{feedback_context}"""
+- Use proper medical terminology, correct grammar, and a professional tone throughout.
+- Ground every number, lab value, and patient ID in the provided data — never hallucinate.
+- Interpret the clinician's question with common sense even if phrased informally or
+  incompletely; don't demand the user restate things in a rigid format.
+- For list queries: if multiple patients, format as "1. Patient ID [ID], [demographics], [key finding]"
+  etc., one per line.
+- If only ONE patient matched a plural question, say so explicitly rather than silently
+  presenting a single case as if it were what was asked for.
+- If NO data or the requested patient was not found: clearly state that fact as the FIRST
+  line of the Patient Summary, in plain language, with no other sections speculating beyond it.
+- Use markdown formatting for readability.
+- Be concise but complete.{status_note}{trend_context}{relevance_warning}{feedback_context}"""
 
         question = state.get("clinical_question", "") or state.get("question", "") or ""
 
@@ -684,11 +1053,11 @@ Respond ONLY in JSON:
             critic_output = {"approved": True, "safety_flags": [], "final_report": reasoning}
 
         final_report = critic_output.get("final_report", reasoning)
-        
+
         # Ensure final_report is not empty and is properly formatted
         if not final_report or len(final_report.strip()) < 50:
             final_report = reasoning
-        
+
         # Remove critique artifacts if they snuck in
         critique_markers = ["the analysis contains", "needs to be revised",
                             "the analysis does not", "hallucinated value",
@@ -697,7 +1066,20 @@ Respond ONLY in JSON:
             final_report = reasoning
 
         approved = critic_output.get("approved", True)
-        safety_flags = critic_output.get("safety_flags", [])
+        safety_flags = list(critic_output.get("safety_flags", []))
+
+        # NEW — hallucination / mismatch guard: flag (don't silently ship)
+        # any patient ID mentioned in the report that never appeared in
+        # the actual SQL results.
+        try:
+            data_ids = {str(pid) for pid in _distinct_patient_ids(sql_result)}
+            mentioned_ids = set(re.findall(r"[Pp]atient(?:\s*ID)?\s*[:#]?\s*(\d{2,})", final_report))
+            unexplained = mentioned_ids - data_ids
+            if unexplained and data_ids:
+                safety_flags.append(f"id_mismatch:{','.join(sorted(unexplained))}")
+                approved = False
+        except Exception:
+            pass
 
         self.audit.log_agent_run("critic_safety", state.get("session_id", ""),
                                  duration, True, user_id=state.get("user_id", ""),
@@ -715,6 +1097,7 @@ Respond ONLY in JSON:
         builder = StateGraph(MIRAState)
 
         builder.add_node("sql_extractor",      self.agent1_sql_extractor)
+        builder.add_node("retry_bump",         self._increment_retry)
         builder.add_node("trend_check",        self.agent_trend_check)
         builder.add_node("semantic_crossref",  self.agent2_semantic_crossref)
         builder.add_node("clinical_reasoning", self.agent3_clinical_reasoning)
@@ -725,8 +1108,9 @@ Respond ONLY in JSON:
 
         builder.add_conditional_edges(
             "sql_extractor", self.should_retry_sql,
-            {"retry": "sql_extractor", "ok": "trend_check"}
+            {"retry": "retry_bump", "ok": "trend_check"}
         )
+        builder.add_edge("retry_bump", "sql_extractor")
         builder.add_edge("trend_check",        "semantic_crossref")
         builder.add_edge("semantic_crossref",  "clinical_reasoning")
         builder.add_edge("clinical_reasoning", "human_review")
@@ -768,17 +1152,37 @@ Respond ONLY in JSON:
         except Exception:
             current_state = {}
 
-        # MemorySaver lost state (Render restart) — run Agent 4 directly
+        # MemorySaver lost state (e.g. a process restart). FIX: only trust
+        # a frontend-supplied paused_state if it actually matches the
+        # question being submitted — previously this reused whatever the
+        # UI happened to have cached, even from an unrelated prior query,
+        # which produced the "same random patient every time" bug.
         if not current_state.get("clinical_question"):
-            if paused_state and paused_state.get("clinical_reasoning"):
-                reasoning = paused_state["clinical_reasoning"]
+            same_question = (
+                paused_state
+                and clinical_question
+                and paused_state.get("clinical_question") == clinical_question
+            )
+            if same_question and paused_state.get("clinical_reasoning"):
+                current_state = dict(paused_state)
+                # Persist recovered state into a fresh checkpoint so future
+                # reads are consistent.
+                try:
+                    self.graph.update_state(config, current_state)
+                except Exception:
+                    pass
+            else:
                 return {
-                    **paused_state,
+                    **(paused_state or make_initial_state(clinical_question, user_id, hospital_id)),
                     "human_decision": decision,
                     "human_feedback": feedback,
-                    "final_report": reasoning,
-                    "approved": True,
-                    "safety_flags": [],
+                    "final_report": (
+                        "Session state could not be recovered for this question. "
+                        "Please start a new audit and resubmit the query rather than "
+                        "approving — no report has been generated to finalize."
+                    ),
+                    "approved": False,
+                    "safety_flags": ["session_state_lost"],
                 }
 
         # Prevent finalizing reports with no/insufficient data
@@ -788,28 +1192,49 @@ Respond ONLY in JSON:
             has_data = len(sql_data.get("rows", [])) > 0 and "error" not in sql_data
         except Exception:
             has_data = False
-        
-        if not has_data and decision == "approve":
-            return {**current_state, "approved": False, "final_report": 
-                   "ERROR: Cannot finalize report — no valid patient data retrieved. Please start a new audit with a different query.",
-                   "safety_flags": ["no_data"]}
 
-        # If rejecting, update feedback and re-run Agent 3 + 4 directly
+        if not has_data and decision == "approve":
+            no_data_state = {
+                **current_state,
+                "approved": False,
+                "final_report": (
+                    "No valid patient data was retrieved for this question, so there is "
+                    "nothing to finalize. Please start a new audit with a different or "
+                    "corrected query (for example, double-check the patient ID or "
+                    "broaden the criteria)."
+                ),
+                "safety_flags": list(set(current_state.get("safety_flags", []) + ["no_data"])),
+            }
+            try:
+                self.graph.update_state(config, no_data_state)
+            except Exception:
+                pass
+            return no_data_state
+
+        # If rejecting, regenerate the report from feedback and PERSIST it.
+        # FIX: previously the revised report was computed and returned but
+        # never written back into the LangGraph checkpoint, so any later
+        # read of state (e.g. a page rerun) still showed the stale report.
         if decision == "reject" and feedback:
             revised_state = {**current_state,
                              "human_decision": "reject",
                              "human_feedback": feedback}
-            # Run Agent 3 to generate revised reasoning based on feedback
             revised_state = self.agent3_clinical_reasoning(revised_state)
-            # Keep feedback context for Agent 4
             revised_state["human_decision"] = "reject"
             revised_state["human_feedback"] = feedback
-            # Run Agent 4 to validate and format final_report
             revised_state = self.agent4_critic_safety(revised_state)
-            # Clear for UI (revision complete)
             revised_state["human_decision"] = ""
             revised_state["human_feedback"] = ""
-            return revised_state  # Return revised report with updated final_report
+
+            self.graph.update_state(config, revised_state)
+            self.audit.log_human_review(user_id, thread_id, decision, True, hospital_id)
+
+            # Return exactly what's now persisted, so caller and checkpoint
+            # can never disagree.
+            try:
+                return self.graph.get_state(config).values
+            except Exception:
+                return revised_state
 
         self.graph.update_state(config, {
             "human_decision": decision,
@@ -821,6 +1246,28 @@ Respond ONLY in JSON:
 
     def get_current_state(self, config: dict) -> MIRAState:
         return self.graph.get_state(config).values
+
+    # ══════════════════════════════════════════════════════════════════
+    # NEW PUBLIC API
+    # ══════════════════════════════════════════════════════════════════
+
+    def start_new_audit(self) -> dict:
+        """
+        Returns a brand-new thread config, guaranteed not to reuse any
+        cached state from a previous question. Wire this to a "Start New
+        Audit" button in your UI, e.g. in Streamlit:
+
+            if st.button("Start New Audit"):
+                st.session_state.config = engine.start_new_audit()
+                st.session_state.paused_state = None
+                st.rerun()
+
+        This is preferable to calling new_thread() directly from the UI
+        because it also clears anything the UI might otherwise be tempted
+        to carry over (the UI should discard its own cached paused_state
+        alongside this call, as shown above).
+        """
+        return self.new_thread()
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -844,11 +1291,21 @@ if __name__ == "__main__":
     print(cfg_obj.describe())
 
     cfg = engine.new_thread()
-    question = "Which patients have abnormal lab results?"
+    question = "which patients show signs of AKI"
     print(f"\nQuery: {question}")
     paused = engine.run_until_review(question, cfg, user_id="dev", hospital_id="demo")
-    print(f"\n🛑 Paused. Preview:\n{paused['clinical_reasoning'][:400]}...")
-    final = engine.submit_human_decision(cfg, "approve", user_id="dev", hospital_id="demo")
+    print(f"\n🛑 Paused. Data status: {paused.get('data_status')}")
+    print(f"Preview:\n{paused['clinical_reasoning'][:400]}...")
+
+    print("\n--- Testing revision path ---")
+    revised = engine.submit_human_decision(
+        cfg, "reject", feedback="Please double check for creatinine trend and be more specific.",
+        user_id="dev", hospital_id="demo", clinical_question=question
+    )
+    print(f"Revised report differs from original: {revised['final_report'] != paused['clinical_reasoning']}")
+
+    final = engine.submit_human_decision(cfg, "approve", user_id="dev", hospital_id="demo",
+                                          clinical_question=question)
     print(f"\n✅ Final report ({len(final['final_report'])} chars)")
     print(f"Approved: {final['approved']}")
     print(f"Safety flags: {final['safety_flags'] or 'None'}")
