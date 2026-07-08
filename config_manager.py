@@ -167,8 +167,14 @@ class ConfigManager:
         return self.deployment_env == "production"
 
     def get_data_source(self, hospital_id: str = "default") -> dict:
-        # Direct override — if MIRA_DEFAULT_DB_URL is set, always use it
-        direct_url = self.get("MIRA_DEFAULT_DB_URL") or self.get("DATABASE_URL")
+        # Direct override — prefer an explicit DB URL, then Supabase, then the SQLite fallback
+        direct_url = (
+            self.get("MIRA_DEFAULT_DB_URL")
+            or self.get("DATABASE_URL")
+            or self.get("SUPABASE_DIRECT_URL")
+            or self.get("SUPABASE_DB_URL")
+            or (self._supabase_db_url() if self.get("SUPABASE_DB_PASSWORD") or self.get("SUPABASE_URL") else "")
+        )
         source_type = self.get("MIRA_DEFAULT_SOURCE_TYPE", "db")
 
         if direct_url and source_type == "db":
@@ -224,9 +230,17 @@ class ConfigManager:
         return {"type": "memory"}
 
     def _supabase_db_url(self) -> str:
+        raw = self.get("SUPABASE_DIRECT_URL") or self.get("SUPABASE_DB_URL")
+        if raw:
+            return raw
+
         password = self.get("SUPABASE_DB_PASSWORD", "")
-        ref = "tfrlbotgzxxdqwviemiz"
-        return f"postgresql://postgres.{ref}:{password}@aws-1-ap-southeast-2.pooler.supabase.com:6543/postgres"
+        ref = self.get("SUPABASE_PROJECT_REF", "tfrlbotgzxxdqwviemiz")
+        user = self.get("SUPABASE_DB_USER", f"postgres.{ref}")
+        host = self.get("SUPABASE_DB_HOST", "aws-1-ap-southeast-2.pooler.supabase.com")
+        port = self.get("SUPABASE_DB_PORT", "6543")
+        db = self.get("SUPABASE_DB_NAME", "postgres")
+        return f"postgresql://{user}:{password}@{host}:{port}/{db}"
 
     def get_audit_config(self) -> dict:
        return {

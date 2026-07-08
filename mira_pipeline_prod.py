@@ -345,10 +345,12 @@ VOCABULARY:
 - LIMIT 25
 - Return ONLY raw SQL, no markdown, no explanation"""
 
+        question = state.get("clinical_question", "") or state.get("question", "") or ""
+
         start = time.monotonic()
         response = self.llm.invoke([
             SystemMessage(content=system_prompt),
-            HumanMessage(content=f"Clinical question: {state['clinical_question']}")
+            HumanMessage(content=f"Clinical question: {question}")
         ])
         raw_sql = response.content.strip().replace("```sql", "").replace("```", "").strip()
 
@@ -420,13 +422,15 @@ VOCABULARY:
         sql_context = state.get("sql_result", "") or "No patient data retrieved."
         hospital_id = state.get("hospital_id", "global")
 
+        question = state.get("clinical_question", "") or state.get("question", "") or ""
+
         response = self.llm.invoke([
             SystemMessage(content=(
                 "Extract the SPECIFIC lab test names and their abnormal direction "
                 "(high/low) from the patient data. Write a semantic search query using "
                 "those EXACT lab names. Return ONLY the search query."
             )),
-            HumanMessage(content=f"Question: {state['clinical_question']}\n"
+            HumanMessage(content=f"Question: {question}\n"
                                   f"Patient data: {sql_context[:1000]}")
         ])
         search_query = response.content.strip()
@@ -492,10 +496,12 @@ Only use numbers/IDs/results that appear verbatim in the patient data below.
 If a lab trajectory is provided, weight it heavily — worsening trend > single abnormal value.
 If zero rows returned after retries, say "no patients matched this threshold" not "data unavailable."{trend_context}{relevance_warning}{feedback_context}"""
 
+        question = state.get("clinical_question", "") or state.get("question", "") or ""
+
         start = time.monotonic()
         response = self.llm.invoke([
             SystemMessage(content=system_prompt),
-            HumanMessage(content=f"Question: {state['clinical_question']}\n\n"
+            HumanMessage(content=f"Question: {question}\n\n"
                                   f"PATIENT DATA:\n{sql_result[:2000]}\n\n"
                                   f"GUIDELINES:\n{guideline_text[:2000]}")
         ])
@@ -534,9 +540,11 @@ If zero rows returned after retries, say "no patients matched this threshold" no
 ## Recommended Actions
 Ground every claim in the data or a cited guideline. Never hallucinate values.{trend_context}{feedback_context}"""
 
+        question = state.get("clinical_question", "") or state.get("question", "") or ""
+
         messages = [
             SystemMessage(content=system_prompt),
-            HumanMessage(content=f"Question: {state['clinical_question']}\n\n"
+            HumanMessage(content=f"Question: {question}\n\n"
                                   f"PATIENT DATA:\n{sql_result[:2000]}\n\n"
                                   f"GUIDELINES:\n{guideline_text[:2000]}")
         ]
@@ -658,15 +666,27 @@ Respond ONLY in JSON:
     def submit_human_decision(self, config: dict, decision: str,
                                feedback: str = "",
                                user_id: str = "",
-                               hospital_id: str = "") -> MIRAState:
+                               hospital_id: str = "",
+                               clinical_question: str = "") -> MIRAState:
         thread_id = config["configurable"]["thread_id"]
-        self.graph.update_state(config, {
+
+        current_state = {}
+        try:
+            current_state = dict(self.graph.get_state(config).values or {})
+        except Exception:
+            current_state = {}
+
+        state_patch = {
             "human_decision": decision,
-            "human_feedback": feedback
-        })
+            "human_feedback": feedback,
+            "clinical_question": clinical_question or current_state.get("clinical_question", ""),
+        }
+
+        merged_state = {**current_state, **state_patch}
+        self.graph.update_state(config, state_patch)
         self.audit.log_human_review(user_id, thread_id, decision,
                                     bool(feedback), hospital_id)
-        return self.graph.invoke(None, config)
+        return self.graph.invoke(merged_state, config)
 
     def get_current_state(self, config: dict) -> MIRAState:
         return self.graph.get_state(config).values

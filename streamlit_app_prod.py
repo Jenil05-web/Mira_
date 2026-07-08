@@ -677,7 +677,8 @@ with tab_audit:
                         render_processing_strip("Sending feedback to reasoning agent")
                     final = engine.submit_human_decision(
                         st.session_state.thread_config, "reject", feedback_text,
-                        user_id=user.user_id, hospital_id=user.hospital_id
+                        user_id=user.user_id, hospital_id=user.hospital_id,
+                        clinical_question=st.session_state.get("pending_question") or ""
                     )
                     ph.empty()
                     st.session_state.paused_state = final
@@ -690,7 +691,8 @@ with tab_audit:
                     render_processing_strip("Running final safety check")
                 final = engine.submit_human_decision(
                     st.session_state.thread_config, "approve",
-                    user_id=user.user_id, hospital_id=user.hospital_id
+                    user_id=user.user_id, hospital_id=user.hospital_id,
+                    clinical_question=st.session_state.get("pending_question") or ""
                 )
                 ph.empty()
                 st.session_state.final_state = final
