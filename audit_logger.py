@@ -122,22 +122,23 @@ class AuditLogger:
             return
 
         record = {
-         "id": str(uuid.uuid4()),
-         "timestamp": datetime.now(timezone.utc).isoformat(),
-         "event_type": event_type,
-         "user_id": kwargs.get("user_id"),
-         "hospital_id": kwargs.get("hospital_id"),
-         "session_id": kwargs.get("session_id"),
-         "thread_id": kwargs.get("thread_id"),
-         "agent_name": kwargs.get("agent_name"),
-         "action_detail": kwargs.get("action_detail"),
-         "rows_returned": kwargs.get("rows_returned"),
-         "duration_ms": kwargs.get("duration_ms"),
-         "success": bool(kwargs.get("success", True)),  # ← bool not int
-         "error_message": kwargs.get("error_message"),
-         "ip_address": kwargs.get("ip_address"),
-         "metadata": json.dumps(kwargs.get("metadata", {}), default=str),
-}
+            "id": str(uuid.uuid4()),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "event_type": event_type,
+            "user_id": kwargs.get("user_id") or "",
+            "hospital_id": kwargs.get("hospital_id") or "",
+            "session_id": kwargs.get("session_id") or "",
+            "thread_id": kwargs.get("thread_id") or "",
+            "agent_name": kwargs.get("agent_name") or "",
+            "tool_name": kwargs.get("tool_name") or "",
+            "action_detail": kwargs.get("action_detail") or "",
+            "rows_returned": kwargs.get("rows_returned") or 0,
+            "duration_ms": kwargs.get("duration_ms") or 0,
+            "success": bool(kwargs.get("success", True)),
+            "error_message": kwargs.get("error_message") or "",
+            "ip_address": kwargs.get("ip_address") or "",
+            "metadata": json.dumps(kwargs.get("metadata", {}), default=str),
+        }
 
         try:
             with self.engine.connect() as conn:
