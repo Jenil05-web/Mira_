@@ -309,8 +309,31 @@ class MIRAEngineProd:
     def agent1_sql_extractor(self, state: MIRAState) -> MIRAState:
         hospital_id = state.get("hospital_id", "default")
         retry_count = state.get("sql_retry_count", 0)
+        question = state.get("clinical_question", "") or state.get("question", "") or ""
 
-        # Always run this broad base query first — guaranteed to return data
+        # Detect if this is a direct patient ID query (e.g., "patient 10003045" or "details of patient 10003045")
+        import re
+        patient_id_match = re.search(r'patient\s*(\d+)', question, re.IGNORECASE)
+        
+        # If specific patient ID mentioned, use targeted query first
+        if patient_id_match:
+            patient_id = patient_id_match.group(1)
+            specific_patient_sql = f"""
+                SELECT p.subject_id, p.gender, p.anchor_age,
+                       d.label AS lab_name, l.valuenum, l.valueuom,
+                       l.ref_range_lower, l.ref_range_upper, l.flag, l.charttime
+                FROM labevents l
+                JOIN patients p ON l.subject_id = p.subject_id
+                JOIN d_labitems d ON l.itemid = d.itemid
+                WHERE p.subject_id = {patient_id}
+                  AND l.valuenum IS NOT NULL
+                ORDER BY l.charttime DESC
+                LIMIT 100
+            """
+        else:
+            specific_patient_sql = None
+
+        # Default broad base query — guaranteed to return data
         base_sql = """
             SELECT p.subject_id, p.gender, p.anchor_age,
                    d.label AS lab_name, l.valuenum, l.valueuom,
@@ -335,6 +358,8 @@ class MIRAEngineProd:
         schema = self._schema_for(hospital_id)
 
         system_prompt = f"""You are a medical SQL expert. Write a single valid PostgreSQL SELECT query.
+Always be flexible and common-sense in understanding the question.
+If a specific patient ID is mentioned, prioritize that patient's data.
 
 DATABASE SCHEMA:
 {schema}
@@ -351,27 +376,40 @@ VOCABULARY:
 - Always JOIN patients p ON l.subject_id = p.subject_id
 - Use table aliases: labevents l, patients p, d_labitems d
 - WHERE l.valuenum IS NOT NULL always
+- When a specific patient ID is mentioned, return ALL their lab data (no abnormal filter needed)
 - CRITICAL: When asked for a LIST of patients, your query MUST return multiple subject_ids. Use IN or GROUP BY or subqueries to ensure data from at least 10 different patients is returned. Never write a query that can return only one subject_id.
-- LIMIT 50 minimum when returning lists
+- LIMIT 50 minimum when returning lists. For single patient queries, LIMIT 100.
 - Return ONLY raw SQL, no markdown, no explanation"""
 
-        question = state.get("clinical_question", "") or state.get("question", "") or ""
-
         start = time.monotonic()
-        response = self.llm.invoke([
-            SystemMessage(content=system_prompt),
-            HumanMessage(content=f"Clinical question: {question}")
-        ])
-        raw_sql = response.content.strip().replace("```sql", "").replace("```", "").strip()
-
-        # Try the generated SQL first
-        result = self.sql_query_tool.invoke({"query": raw_sql, "hospital_id": hospital_id})
+        
+        # Try specific patient query first if detected
+        result = None
+        raw_sql = None
+        if specific_patient_sql:
+            result = self.sql_query_tool.invoke({"query": specific_patient_sql, "hospital_id": hospital_id})
+            parsed = json.loads(result)
+            rows = parsed.get("rows", [])
+            if rows and "error" not in parsed:
+                raw_sql = specific_patient_sql
+            else:
+                result = None
+        
+        # If specific patient query failed or not attempted, generate SQL from LLM
+        if result is None:
+            response = self.llm.invoke([
+                SystemMessage(content=system_prompt),
+                HumanMessage(content=f"Clinical question: {question}")
+            ])
+            raw_sql = response.content.strip().replace("```sql", "").replace("```", "").strip()
+            result = self.sql_query_tool.invoke({"query": raw_sql, "hospital_id": hospital_id})
+        
         parsed = json.loads(result)
         rows = parsed.get("rows", [])
 
-        # If error or 0 rows — immediately use the broad base query
+        # If error or 0 rows — try base query as fallback
         if "error" in parsed or len(rows) == 0:
-            print(f"Generated SQL returned 0 rows or error. Using base fallback query.")
+            print(f"Generated SQL returned 0 rows or error. Trying base fallback query.")
             result = self.sql_query_tool.invoke({"query": base_sql, "hospital_id": hospital_id})
             parsed = json.loads(result)
             rows = parsed.get("rows", [])
@@ -707,10 +745,14 @@ Respond ONLY in JSON:
             revised_state = {**current_state,
                              "human_decision": "reject",
                              "human_feedback": feedback}
+            # Run Agent 3 to generate revised reasoning based on feedback
             revised_state = self.agent3_clinical_reasoning(revised_state)
+            # Run Agent 4 to validate and generate final_report
+            revised_state = self.agent4_critic_safety(revised_state)
+            # Clear decision fields for next review cycle
             revised_state["human_decision"] = ""
             revised_state["human_feedback"] = ""
-            return revised_state  # Return to awaiting_review with new reasoning
+            return revised_state  # Return revised report with updated final_report
 
         self.graph.update_state(config, {
             "human_decision": decision,
