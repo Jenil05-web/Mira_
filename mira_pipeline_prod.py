@@ -507,6 +507,23 @@ VOCABULARY:
         sql_result = state.get("sql_result", "No patient data.")
         guideline_text = self._build_guideline_text(state.get("guidelines", ""))
 
+        # Count unique patients in result
+        unique_patients = set()
+        try:
+            rows = json.loads(sql_result).get("rows", [])
+            for row in rows:
+                if "subject_id" in row:
+                    unique_patients.add(row["subject_id"])
+        except Exception:
+            rows = []
+        
+        patient_count_note = ""
+        if len(unique_patients) == 1:
+            patient_count_note = ("\n\nNOTE: Only ONE patient matched the criteria. "
+                                 "The analysis below refers to a single patient case.")
+        elif len(unique_patients) == 0:
+            patient_count_note = "\n\nWARNING: No patients found matching the query criteria."
+
         trend_context = ""
         try:
             td = state.get("trend_data", "")
@@ -534,16 +551,29 @@ VOCABULARY:
                 f"\n\nCLINICIAN FEEDBACK (revise accordingly):\n{state['human_feedback']}"
             )
 
-        system_prompt = f"""You are an expert clinical AI assistant. Synthesize data into:
+        system_prompt = f"""You are an expert clinical AI assistant. Write a professional, well-structured clinical report.
+
+Format your response EXACTLY as:
 ## Patient Summary
+[Clear, concise patient demographics and chief findings]
+
 ## Identified Concerns
+[Bullet points of abnormal findings with values]
+
 ## Clinical Guideline Context
+[Relevant guidelines or clinical pearls]
+
 ## Recommended Actions
-Ground every claim in the data or a cited guideline. Never hallucinate values.
-Only use numbers/IDs/results that appear verbatim in the patient data below.
-If a lab trajectory is provided, weight it heavily — worsening trend > single abnormal value.
-If zero rows returned after retries, say "no patients matched this threshold" not "data unavailable."
-If the question asks for a LIST of patients, format your Patient Summary as a numbered list with one entry per subject_id. Include each patient's ID, gender, age, and their most critical finding. Never collapse multiple patients into a single paragraph.{trend_context}{relevance_warning}{feedback_context}"""
+[Specific, actionable recommendations]
+
+IMPORTANT GUIDELINES:
+- Use proper medical terminology and professional tone
+- Ground every number, lab value, and ID in the provided data — never hallucinate
+- For list queries: if multiple patients, format as "1. Patient ID [ID], [demographics], [key finding]\n2. Patient ID..." etc
+- If only ONE patient: explicitly state this is a single-patient analysis
+- If NO data: clearly state "No patients matched the query criteria"
+- Use markdown formatting for readability
+- Be concise but complete{patient_count_note}{trend_context}{relevance_warning}{feedback_context}"""
 
         question = state.get("clinical_question", "") or state.get("question", "") or ""
 
@@ -616,19 +646,25 @@ Ground every claim in the data or a cited guideline. Never hallucinate values.{t
         sql_result = state.get("sql_result", "")
         guidelines = state.get("guidelines", "")
 
-        system_prompt = """You are a medical AI safety critic AND editor.
-Check ONLY for: (1) values in the report that do NOT appear in the patient data,
-(2) recommendations that contradict the guidelines, (3) completely missing
-Recommended Actions section.
+        system_prompt = """You are a medical AI safety critic AND formatter.
+Your job: validate the draft report and ensure it's properly formatted as a professional clinical document.
 
-DO NOT flag missing lab tests that weren't in the original query.
-DO NOT flag incomplete analysis for tests not requested.
-DO NOT flag guideline mismatch unless the report directly contradicts a guideline.
+Validation checks:
+1. ALL values/numbers must appear in the patient data (no hallucinations)
+2. Recommendations must be clinically sound (not contradicting guidelines)
+3. Must have all four sections: Patient Summary, Identified Concerns, Clinical Guideline Context, Recommended Actions
 
-If the report addresses the clinical question asked and all values are grounded
-in the patient data — approve it. Be permissive, not exhaustive.
+Be PERMISSIVE: Don't flag missing tests, incomplete analysis for unrequested items, or minor guideline gaps.
 
-CRITICAL: final_report must be a complete clinical report, never a critique.
+Formatting fixes:
+- Ensure proper markdown structure with ## headers
+- Use bullet points for lists
+- Make sure patient IDs and values are clearly stated
+- Ensure professional, grammatically correct tone
+- If report mentions single patient, keep that note
+
+CRITICAL: final_report must be the complete, formatted clinical report.
+NEVER put critique text or meta-comments in final_report.
 Respond ONLY in JSON:
 {"approved": true/false, "safety_flags": [], "corrections": "...", "final_report": "..."}"""
 
@@ -648,11 +684,16 @@ Respond ONLY in JSON:
             critic_output = {"approved": True, "safety_flags": [], "final_report": reasoning}
 
         final_report = critic_output.get("final_report", reasoning)
-
+        
+        # Ensure final_report is not empty and is properly formatted
+        if not final_report or len(final_report.strip()) < 50:
+            final_report = reasoning
+        
+        # Remove critique artifacts if they snuck in
         critique_markers = ["the analysis contains", "needs to be revised",
                             "the analysis does not", "hallucinated value",
-                            "issues that need addressing"]
-        if any(m in final_report.lower()[:300] for m in critique_markers):
+                            "issues that need addressing", "critique:", "issues:"]
+        if any(m in final_report.lower()[:500] for m in critique_markers):
             final_report = reasoning
 
         approved = critic_output.get("approved", True)
@@ -740,6 +781,19 @@ Respond ONLY in JSON:
                     "safety_flags": [],
                 }
 
+        # Prevent finalizing reports with no/insufficient data
+        sql_result = current_state.get("sql_result", "")
+        try:
+            sql_data = json.loads(sql_result) if sql_result else {}
+            has_data = len(sql_data.get("rows", [])) > 0 and "error" not in sql_data
+        except Exception:
+            has_data = False
+        
+        if not has_data and decision == "approve":
+            return {**current_state, "approved": False, "final_report": 
+                   "ERROR: Cannot finalize report — no valid patient data retrieved. Please start a new audit with a different query.",
+                   "safety_flags": ["no_data"]}
+
         # If rejecting, update feedback and re-run Agent 3 + 4 directly
         if decision == "reject" and feedback:
             revised_state = {**current_state,
@@ -747,9 +801,12 @@ Respond ONLY in JSON:
                              "human_feedback": feedback}
             # Run Agent 3 to generate revised reasoning based on feedback
             revised_state = self.agent3_clinical_reasoning(revised_state)
-            # Run Agent 4 to validate and generate final_report
+            # Keep feedback context for Agent 4
+            revised_state["human_decision"] = "reject"
+            revised_state["human_feedback"] = feedback
+            # Run Agent 4 to validate and format final_report
             revised_state = self.agent4_critic_safety(revised_state)
-            # Clear decision fields for next review cycle
+            # Clear for UI (revision complete)
             revised_state["human_decision"] = ""
             revised_state["human_feedback"] = ""
             return revised_state  # Return revised report with updated final_report
