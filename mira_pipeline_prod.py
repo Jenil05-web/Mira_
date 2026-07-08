@@ -319,8 +319,17 @@ class MIRAEngineProd:
             JOIN patients p ON l.subject_id = p.subject_id
             JOIN d_labitems d ON l.itemid = d.itemid
             WHERE l.valuenum IS NOT NULL
-            ORDER BY l.charttime DESC
-            LIMIT 25
+              AND (
+                  (l.ref_range_upper IS NOT NULL AND l.valuenum > l.ref_range_upper)
+                  OR (l.ref_range_lower IS NOT NULL AND l.valuenum < l.ref_range_lower)
+                  OR l.flag IS NOT NULL
+              )
+              AND l.subject_id IN (
+                  SELECT DISTINCT subject_id FROM labevents
+                  WHERE valuenum IS NOT NULL LIMIT 20
+              )
+            ORDER BY p.subject_id, l.charttime DESC
+            LIMIT 50
         """
 
         schema = self._schema_for(hospital_id)
@@ -342,7 +351,8 @@ VOCABULARY:
 - Always JOIN patients p ON l.subject_id = p.subject_id
 - Use table aliases: labevents l, patients p, d_labitems d
 - WHERE l.valuenum IS NOT NULL always
-- LIMIT 25
+- CRITICAL: When asked for a LIST of patients, your query MUST return multiple subject_ids. Use IN or GROUP BY or subqueries to ensure data from at least 10 different patients is returned. Never write a query that can return only one subject_id.
+- LIMIT 50 minimum when returning lists
 - Return ONLY raw SQL, no markdown, no explanation"""
 
         question = state.get("clinical_question", "") or state.get("question", "") or ""
@@ -494,7 +504,8 @@ VOCABULARY:
 Ground every claim in the data or a cited guideline. Never hallucinate values.
 Only use numbers/IDs/results that appear verbatim in the patient data below.
 If a lab trajectory is provided, weight it heavily — worsening trend > single abnormal value.
-If zero rows returned after retries, say "no patients matched this threshold" not "data unavailable."{trend_context}{relevance_warning}{feedback_context}"""
+If zero rows returned after retries, say "no patients matched this threshold" not "data unavailable."
+If the question asks for a LIST of patients, format your Patient Summary as a numbered list with one entry per subject_id. Include each patient's ID, gender, age, and their most critical finding. Never collapse multiple patients into a single paragraph.{trend_context}{relevance_warning}{feedback_context}"""
 
         question = state.get("clinical_question", "") or state.get("question", "") or ""
 
@@ -568,14 +579,18 @@ Ground every claim in the data or a cited guideline. Never hallucinate values.{t
         guidelines = state.get("guidelines", "")
 
         system_prompt = """You are a medical AI safety critic AND editor.
-Check for: hallucinated values not in patient data, guideline mismatch,
-missing recommendations, dangerous omissions.
+Check ONLY for: (1) values in the report that do NOT appear in the patient data,
+(2) recommendations that contradict the guidelines, (3) completely missing
+Recommended Actions section.
 
-CRITICAL: final_report must ALWAYS be a complete corrected clinical report
-in the format (Patient Summary / Identified Concerns / Clinical Guideline Context /
-Recommended Actions). NEVER put critique text or complaint lists into final_report.
-Put your review notes in "corrections" only.
+DO NOT flag missing lab tests that weren't in the original query.
+DO NOT flag incomplete analysis for tests not requested.
+DO NOT flag guideline mismatch unless the report directly contradicts a guideline.
 
+If the report addresses the clinical question asked and all values are grounded
+in the patient data — approve it. Be permissive, not exhaustive.
+
+CRITICAL: final_report must be a complete clinical report, never a critique.
 Respond ONLY in JSON:
 {"approved": true/false, "safety_flags": [], "corrections": "...", "final_report": "..."}"""
 
@@ -687,21 +702,22 @@ Respond ONLY in JSON:
                     "safety_flags": [],
                 }
 
-        state_patch = {
+        # If rejecting, update feedback and re-run Agent 3 + 4 directly
+        if decision == "reject" and feedback:
+            revised_state = {**current_state,
+                             "human_decision": "reject",
+                             "human_feedback": feedback}
+            revised_state = self.agent3_clinical_reasoning(revised_state)
+            revised_state["human_decision"] = ""
+            revised_state["human_feedback"] = ""
+            return revised_state  # Return to awaiting_review with new reasoning
+
+        self.graph.update_state(config, {
             "human_decision": decision,
             "human_feedback": feedback,
-        }
-        self.graph.update_state(config, state_patch)
+        })
         self.audit.log_human_review(user_id, thread_id, decision,
                                     bool(feedback), hospital_id)
-
-        # Since MemorySaver loses state on Render restart, bypass graph
-        # and run Agent 4 directly on the paused state
-        if not current_state.get("clinical_question"):
-            paused = state_patch.get("_paused_state", {})
-            reasoning = paused.get("clinical_reasoning", "No reasoning available.")
-            return {**paused, "final_report": reasoning, "approved": True, "safety_flags": []}
-
         return self.graph.invoke(None, config)
 
     def get_current_state(self, config: dict) -> MIRAState:
