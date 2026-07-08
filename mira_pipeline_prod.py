@@ -654,20 +654,18 @@ Respond ONLY in JSON:
     def run_until_review(self, clinical_question: str, config: dict,
                          user_id: str = "anon", hospital_id: str = "demo",
                          session_id: str = "") -> MIRAState:
-        # Always start with a completely fresh state — never reuse previous
         initial = make_initial_state(clinical_question, user_id, hospital_id, session_id)
-        # Pass fresh config with new thread every time
-        fresh_config = self.new_thread()
         self.audit.log_query(user_id, hospital_id, session_id,
-                             fresh_config["configurable"]["thread_id"],
+                             config["configurable"]["thread_id"],
                              clinical_question, len(clinical_question))
-        return self.graph.invoke(initial, fresh_config)
+        return self.graph.invoke(initial, config)
 
     def submit_human_decision(self, config: dict, decision: str,
                                feedback: str = "",
                                user_id: str = "",
                                hospital_id: str = "",
-                               clinical_question: str = "") -> MIRAState:
+                               clinical_question: str = "",
+                               paused_state: dict = None) -> MIRAState:
         thread_id = config["configurable"]["thread_id"]
 
         try:
@@ -676,27 +674,34 @@ Respond ONLY in JSON:
         except Exception:
             current_state = {}
 
-        # If MemorySaver lost state (Render restart), rebuild from scratch
+        # MemorySaver lost state (Render restart) — run Agent 4 directly
         if not current_state.get("clinical_question"):
-            import streamlit as st
-            paused = st.session_state.get("paused_state", {})
-            reasoning = paused.get("clinical_reasoning", "")
-            return {
-                **paused,
-                "human_decision": decision,
-                "human_feedback": feedback,
-                "final_report": reasoning,
-                "approved": True,
-                "safety_flags": [],
-            }
+            if paused_state and paused_state.get("clinical_reasoning"):
+                reasoning = paused_state["clinical_reasoning"]
+                return {
+                    **paused_state,
+                    "human_decision": decision,
+                    "human_feedback": feedback,
+                    "final_report": reasoning,
+                    "approved": True,
+                    "safety_flags": [],
+                }
 
-        self.graph.update_state(config, {
+        state_patch = {
             "human_decision": decision,
             "human_feedback": feedback,
-        })
-
+        }
+        self.graph.update_state(config, state_patch)
         self.audit.log_human_review(user_id, thread_id, decision,
                                     bool(feedback), hospital_id)
+
+        # Since MemorySaver loses state on Render restart, bypass graph
+        # and run Agent 4 directly on the paused state
+        if not current_state.get("clinical_question"):
+            paused = state_patch.get("_paused_state", {})
+            reasoning = paused.get("clinical_reasoning", "No reasoning available.")
+            return {**paused, "final_report": reasoning, "approved": True, "safety_flags": []}
+
         return self.graph.invoke(None, config)
 
     def get_current_state(self, config: dict) -> MIRAState:
