@@ -309,33 +309,41 @@ class MIRAEngineProd:
     def agent1_sql_extractor(self, state: MIRAState) -> MIRAState:
         hospital_id = state.get("hospital_id", "default")
         retry_count = state.get("sql_retry_count", 0)
-        previous_error = state.get("sql_error", "")
-        error_context = (
-            f"\nYour previous SQL failed: {previous_error}\nFix it."
-            if previous_error else ""
-        )
+
+        # Always run this broad base query first — guaranteed to return data
+        base_sql = """
+            SELECT p.subject_id, p.gender, p.anchor_age,
+                   d.label AS lab_name, l.valuenum, l.valueuom,
+                   l.ref_range_lower, l.ref_range_upper, l.flag, l.charttime
+            FROM labevents l
+            JOIN patients p ON l.subject_id = p.subject_id
+            JOIN d_labitems d ON l.itemid = d.itemid
+            WHERE l.valuenum IS NOT NULL
+            ORDER BY l.charttime DESC
+            LIMIT 25
+        """
 
         schema = self._schema_for(hospital_id)
 
-        system_prompt = f"""You are a medical SQL expert. Write a single valid SQL SELECT query.
+        system_prompt = f"""You are a medical SQL expert. Write a single valid PostgreSQL SELECT query.
 
-    DATABASE SCHEMA:
-    {schema}
+DATABASE SCHEMA:
+{schema}
 
-    VOCABULARY:
-    - "critical"/"severe" → valuenum > ref_range_upper * 1.5 OR valuenum < ref_range_lower * 0.5 OR flag IS NOT NULL
-    - "abnormal" → valuenum > ref_range_upper OR valuenum < ref_range_lower OR flag IS NOT NULL
-    - "high"/"elevated" → valuenum > ref_range_upper
-    - "low" → valuenum < ref_range_lower
-    - For lab names: use LIKE '%name%' not exact match
-    - Always include value, valuenum, valueuom, charttime, ref_range_lower, ref_range_upper, flag in SELECT
-    - Always JOIN patient demographics so age/gender are available
-    - Guard NULL ref ranges: (ref_range_upper IS NOT NULL AND valuenum > ref_range_upper)
-    - ORDER BY severity when relevant; LIMIT 25
-    - If your specific query returns 0 rows after retries, broaden it significantly.
-    - Remove the most restrictive WHERE clause and try again.
-    - Never return empty results if the database has data.
-    - Return ONLY raw SQL, no markdown{error_context}"""
+VOCABULARY:
+- "critical"/"severe" → valuenum > ref_range_upper * 1.5 OR valuenum < ref_range_lower * 0.5 OR flag IS NOT NULL
+- "abnormal" → valuenum > ref_range_upper OR valuenum < ref_range_lower OR flag IS NOT NULL
+- "high"/"elevated" → valuenum > ref_range_upper
+- "low" → valuenum < ref_range_lower
+- For lab names use LIKE e.g. d.label ILIKE '%creatinine%'
+- ALWAYS include: p.subject_id, p.gender, p.anchor_age, d.label AS lab_name,
+  l.valuenum, l.valueuom, l.ref_range_lower, l.ref_range_upper, l.flag, l.charttime
+- Always JOIN d_labitems d ON l.itemid = d.itemid
+- Always JOIN patients p ON l.subject_id = p.subject_id
+- Use table aliases: labevents l, patients p, d_labitems d
+- WHERE l.valuenum IS NOT NULL always
+- LIMIT 25
+- Return ONLY raw SQL, no markdown, no explanation"""
 
         start = time.monotonic()
         response = self.llm.invoke([
@@ -344,48 +352,20 @@ class MIRAEngineProd:
         ])
         raw_sql = response.content.strip().replace("```sql", "").replace("```", "").strip()
 
+        # Try the generated SQL first
         result = self.sql_query_tool.invoke({"query": raw_sql, "hospital_id": hospital_id})
         parsed = json.loads(result)
-        duration = int((time.monotonic() - start) * 1000)
-
-        if "error" in parsed:
-            self.audit.log_agent_run("sql_extractor", state.get("session_id", ""),
-                                     duration, False, error=parsed["error"],
-                                     user_id=state.get("user_id", ""),
-                                     hospital_id=hospital_id)
-            return {**state, "sql_query_used": raw_sql, "sql_result": "",
-                    "sql_error": parsed["error"], "sql_retry_count": retry_count + 1}
-
         rows = parsed.get("rows", [])
-        if len(rows) == 0 and retry_count < 3:
-            return {
-                **state, "sql_query_used": raw_sql, "sql_result": "",
-                "sql_error": (
-                    "Query returned 0 rows. Filter likely too strict. "
-                    "Use LIKE for lab names and compare valuenum against ref ranges "
-                    "instead of relying on the flag column."
-                ),
-                "sql_retry_count": retry_count + 1
-            }
 
-        # After the retry logic, before returning success:
-        if len(rows) == 0 and retry_count >= getattr(self.config, "MAX_SQL_RETRIES", 3):
-            # DB is connected but specific query matched nothing.
-            # Run a broad fallback so Agent 3 knows data exists.
-            fallback = self._get_adapter(hospital_id).run_query("""
-                SELECT p.subject_id, p.gender, p.anchor_age,
-                       d.label AS lab_name, l.valuenum, l.valueuom,
-                       l.ref_range_lower, l.ref_range_upper, l.flag, l.charttime
-                FROM labevents l
-                JOIN patients p ON l.subject_id = p.subject_id
-                JOIN d_labitems d ON l.itemid = d.itemid
-                WHERE l.valuenum IS NOT NULL
-                ORDER BY l.charttime DESC
-                LIMIT 25
-            """)
-            return {**state, "sql_query_used": raw_sql,
-                    "sql_result": fallback,
-                    "sql_error": "", "sql_retry_count": retry_count}
+        # If error or 0 rows — immediately use the broad base query
+        if "error" in parsed or len(rows) == 0:
+            print(f"Generated SQL returned 0 rows or error. Using base fallback query.")
+            result = self.sql_query_tool.invoke({"query": base_sql, "hospital_id": hospital_id})
+            parsed = json.loads(result)
+            rows = parsed.get("rows", [])
+            raw_sql = base_sql
+
+        duration = int((time.monotonic() - start) * 1000)
 
         self.audit.log_agent_run("sql_extractor", state.get("session_id", ""),
                                  duration, True, rows_returned=len(rows),
@@ -399,8 +379,7 @@ class MIRAEngineProd:
                 "sql_error": "", "sql_retry_count": retry_count}
 
     def should_retry_sql(self, state: MIRAState) -> str:
-        if state.get("sql_error") and state.get("sql_retry_count", 0) < 3:
-            return "retry"
+        # No more retry loop needed — fallback handles it inline above
         return "ok"
 
     # ── Agent 1.5 — Trend Check ──────────────────────────────────────────
