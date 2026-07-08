@@ -82,6 +82,10 @@ class AuditLogger:
         self.connection_string = connection_string
         self.enabled = enabled
         if enabled:
+            if not connection_string:
+                self.enabled = False
+                logger.warning("AuditLogger disabled because no connection string was provided.")
+                return
             self.engine = create_engine(connection_string)
             self._ensure_table()
 
@@ -142,16 +146,21 @@ class AuditLogger:
 
         try:
             with self.engine.connect() as conn:
-                conn.execute(text("""
-                    INSERT INTO mira_audit_log
-                    (id, timestamp, event_type, user_id, hospital_id, session_id,
-                     thread_id, agent_name, tool_name, action_detail, rows_returned,
-                     duration_ms, success, error_message, ip_address, metadata)
-                    VALUES
-                    (:id, :timestamp, :event_type, :user_id, :hospital_id, :session_id,
-                     :thread_id, :agent_name, :tool_name, :action_detail, :rows_returned,
-                     :duration_ms, :success, :error_message, :ip_address, :metadata)
-                """), record)
+                conn.execute(
+                    text(
+                        """
+                        INSERT INTO mira_audit_log
+                        (id, timestamp, event_type, user_id, hospital_id, session_id,
+                         thread_id, agent_name, tool_name, action_detail, rows_returned,
+                         duration_ms, success, error_message, ip_address, metadata)
+                        VALUES
+                        (%(id)s, %(timestamp)s, %(event_type)s, %(user_id)s, %(hospital_id)s, %(session_id)s,
+                         %(thread_id)s, %(agent_name)s, %(tool_name)s, %(action_detail)s, %(rows_returned)s,
+                         %(duration_ms)s, %(success)s, %(error_message)s, %(ip_address)s, %(metadata)s)
+                        """
+                    ),
+                    record,
+                )
                 conn.commit()
         except Exception as e:
             # Audit log failure should never crash the application.

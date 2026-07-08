@@ -230,12 +230,22 @@ class ConfigManager:
         return {"type": "memory"}
 
     def _supabase_db_url(self) -> str:
-        raw = self.get("SUPABASE_DIRECT_URL") or self.get("SUPABASE_DB_URL")
-        if raw:
-            return raw
+        pooler_url = self.get("SUPABASE_POOLER_URL") or self.get("SUPABASE_POOLER_DB_URL")
+        if pooler_url:
+            return pooler_url
+
+        legacy_direct = self.get("SUPABASE_DIRECT_URL") or self.get("SUPABASE_DB_URL")
+        if legacy_direct and ("pooler.supabase.com" in legacy_direct or ":6543" in legacy_direct):
+            return legacy_direct
 
         password = self.get("SUPABASE_DB_PASSWORD", "")
-        ref = self.get("SUPABASE_PROJECT_REF", "tfrlbotgzxxdqwviemiz")
+        ref = (
+            self.get("SUPABASE_PROJECT_REF")
+            or self.get("SUPABASE_PROJECT_ID")
+            or self.get("SUPABASE_REF")
+            or self.get("SUPABASE_URL", "").replace("https://", "").replace(".supabase.co", "")
+            or "tfrlbotgzxxdqwviemiz"
+        )
         user = self.get("SUPABASE_DB_USER", f"postgres.{ref}")
         host = self.get("SUPABASE_DB_HOST", "aws-1-ap-southeast-2.pooler.supabase.com")
         port = self.get("SUPABASE_DB_PORT", "6543")

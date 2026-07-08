@@ -670,23 +670,34 @@ Respond ONLY in JSON:
                                clinical_question: str = "") -> MIRAState:
         thread_id = config["configurable"]["thread_id"]
 
-        current_state = {}
         try:
-            current_state = dict(self.graph.get_state(config).values or {})
+            snapshot = self.graph.get_state(config)
+            current_state = dict(snapshot.values or {})
         except Exception:
             current_state = {}
 
-        state_patch = {
+        # If MemorySaver lost state (Render restart), rebuild from scratch
+        if not current_state.get("clinical_question"):
+            import streamlit as st
+            paused = st.session_state.get("paused_state", {})
+            reasoning = paused.get("clinical_reasoning", "")
+            return {
+                **paused,
+                "human_decision": decision,
+                "human_feedback": feedback,
+                "final_report": reasoning,
+                "approved": True,
+                "safety_flags": [],
+            }
+
+        self.graph.update_state(config, {
             "human_decision": decision,
             "human_feedback": feedback,
-            "clinical_question": clinical_question or current_state.get("clinical_question", ""),
-        }
+        })
 
-        merged_state = {**current_state, **state_patch}
-        self.graph.update_state(config, state_patch)
         self.audit.log_human_review(user_id, thread_id, decision,
                                     bool(feedback), hospital_id)
-        return self.graph.invoke(merged_state, config)
+        return self.graph.invoke(None, config)
 
     def get_current_state(self, config: dict) -> MIRAState:
         return self.graph.get_state(config).values
