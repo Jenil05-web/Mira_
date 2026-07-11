@@ -154,9 +154,9 @@ class AuditLogger:
                          thread_id, agent_name, tool_name, action_detail, rows_returned,
                          duration_ms, success, error_message, ip_address, metadata)
                         VALUES
-                        (%(id)s, %(timestamp)s, %(event_type)s, %(user_id)s, %(hospital_id)s, %(session_id)s,
-                         %(thread_id)s, %(agent_name)s, %(tool_name)s, %(action_detail)s, %(rows_returned)s,
-                         %(duration_ms)s, %(success)s, %(error_message)s, %(ip_address)s, %(metadata)s)
+                        (:id, :timestamp, :event_type, :user_id, :hospital_id, :session_id,
+                         :thread_id, :agent_name, :tool_name, :action_detail, :rows_returned,
+                         :duration_ms, :success, :error_message, :ip_address, :metadata)
                         """
                     ),
                     record,

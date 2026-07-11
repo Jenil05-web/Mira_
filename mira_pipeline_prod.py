@@ -66,14 +66,60 @@ WHAT WAS FIXED IN THIS VERSION
    this is a backend hook; wiring an actual button is a one-line change in
    your Streamlit file, shown in the docstring for that method.)
 
+8. PERSISTENT CHECKPOINTS
+   `config_manager.get_checkpoint_config()` already returns a proper
+   Postgres connection string whenever Supabase is configured, but it was
+   never actually consulted — every deployment silently ran on
+   MemorySaver, meaning every audit (including in-progress revisions) was
+   lost on any restart. Fixed: `_build_checkpointer()` now uses
+   PostgresSaver whenever Supabase is available, falling back to
+   MemorySaver with a clear log warning otherwise.
+
+9. MULTILINGUAL VOICE INPUT (English / Hindi / Gujarati)
+   Added `transcribe_voice_query()` using Whisper. Non-English audio is
+   translated to English via Whisper's /translations endpoint (everything
+   downstream — SQL generation, condition vocabulary, patient-ID
+   extraction — only understands English medical terms), while the
+   verbatim transcript in the original language is always preserved
+   in `original_transcript` for the audit trail. New MIRAState fields:
+   `input_mode`, `spoken_language`, `original_transcript`.
+
+10. GUIDELINE SEARCH CACHING (cost control)
+   Added a small in-memory cache in `VectorStore.search()` so a "Request
+   revision" loop — which often re-runs a very similar guideline search —
+   doesn't re-pay for the same embedding + search repeatedly in one
+   session. Deliberately simple (single-instance, in-memory); revisit with
+   a shared cache once you're running more than one instance.
+
+11. AUTO-DETECT VOICE LANGUAGE WAS SILENTLY BROKEN
+   `transcribe_voice_query(spoken_language="auto")` called Whisper's
+   transcription endpoint without `response_format="verbose_json"`, so
+   the response never actually carried a `language` field. That made
+   `detected_lang` fall back to `"en"` on every single call — regardless
+   of what was actually spoken — which meant the `!= "en"` check that
+   should trigger translation NEVER fired. Hindi/Gujarati recordings were
+   silently passed straight into the SQL/condition-vocabulary agents in
+   their original language (which those agents don't understand), and the
+   UI would always report "English" as the detected language no matter
+   what was said. Fixed: the transcription call now requests
+   `response_format="verbose_json"` so `language` is actually populated,
+   and the comparison uses Whisper's real output format — the full
+   language name in lowercase English (e.g. "english", "hindi",
+   "gujarati"), not an ISO code, which is what Whisper actually returns.
+
 BACKWARDS COMPATIBLE:
   If no Supabase credentials are set, the pipeline behaves exactly like
   before — SQLite + FAISS + MemorySaver.
 
 INSTALL (production extras beyond base requirements):
   pip install sqlalchemy psycopg2-binary langgraph-checkpoint-postgres
+  # ^ langgraph-checkpoint-postgres is REQUIRED for persistent checkpoints
+  #   once Supabase is configured (see _build_checkpointer below). Without
+  #   it, the app falls back to MemorySaver and logs a warning — it will
+  #   still run, but every audit session is lost on restart/redeploy.
 """
 
+import io
 import json
 import logging
 import os
@@ -107,6 +153,13 @@ logger = logging.getLogger(__name__)
 
 MAX_SQL_RETRIES = 2          # how many times we'll broaden a list query
 MIN_LIST_PATIENTS = 2        # below this, a "plural" question is treated as under-served
+
+# NEW — voice-input languages. Whisper's /translations endpoint always
+# outputs English regardless of spoken language, which is exactly what we
+# want here: the SQL/condition-vocabulary agents downstream only understand
+# English medical terms, so non-English speech is translated on the way in
+# rather than requiring the rest of the pipeline to be multilingual-aware.
+VOICE_LANGUAGE_CODES = {"english": "en", "hindi": "hi", "gujarati": "gu"}
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -286,12 +339,21 @@ class MIRAState(TypedDict):
     requested_patient_ids: list
     found_patient_ids:     list
     missing_patient_ids:   list
+    # NEW — voice-input provenance (for audit trail transparency: a
+    # clinician or hospital reviewer should always be able to see the
+    # original spoken wording, not just whatever it was translated into)
+    input_mode:           str   # "text" | "voice"
+    spoken_language:      str   # "english" | "hindi" | "gujarati" | ""
+    original_transcript:  str   # raw transcript before any translation
 
 
 def make_initial_state(clinical_question: str,
                        user_id: str = "anon",
                        hospital_id: str = "demo",
-                       session_id: str = "") -> MIRAState:
+                       session_id: str = "",
+                       input_mode: str = "text",
+                       spoken_language: str = "",
+                       original_transcript: str = "") -> MIRAState:
     return {
         "clinical_question": clinical_question,
         "sql_query_used": "", "sql_result": "", "sql_retry_count": 0, "sql_error": "",
@@ -307,6 +369,9 @@ def make_initial_state(clinical_question: str,
         "requested_patient_ids": [],
         "found_patient_ids": [],
         "missing_patient_ids": [],
+        "input_mode": input_mode,
+        "spoken_language": spoken_language,
+        "original_transcript": original_transcript,
     }
 
 
@@ -326,6 +391,14 @@ class VectorStore:
         self._embedding_model = "text-embedding-3-small"
         vs_cfg = cfg.get_vector_store_config()
         self._type = vs_cfg["type"]
+        # NEW — cost control: a "Request revision" loop re-runs
+        # agent2_semantic_crossref, which often produces the same or a very
+        # similar search query as before. Caching avoids paying for a fresh
+        # embedding + search on every revision round on the same session.
+        # Deliberately small and in-memory — fine for a single-instance demo;
+        # revisit with a shared cache (e.g. Redis) once running multi-instance.
+        self._search_cache: dict[tuple, list[dict]] = {}
+        self._search_cache_max = 200
 
         if self._type == "pgvector":
             from sqlalchemy import create_engine, text
@@ -351,9 +424,20 @@ class VectorStore:
 
     def search(self, query: str, k: int = 3,
                hospital_id: str = "global") -> list[dict]:
+        cache_key = (query.strip().lower(), k, hospital_id)
+        cached = self._search_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
         if self._type == "pgvector":
-            return self._search_pgvector(query, k, hospital_id)
-        return self._search_faiss(query, k)
+            results = self._search_pgvector(query, k, hospital_id)
+        else:
+            results = self._search_faiss(query, k)
+
+        if len(self._search_cache) >= self._search_cache_max:
+            self._search_cache.pop(next(iter(self._search_cache)))  # evict oldest
+        self._search_cache[cache_key] = results
+        return results
 
     def _search_pgvector(self, query: str, k: int, hospital_id: str) -> list[dict]:
         from sqlalchemy import text
@@ -416,8 +500,15 @@ class MIRAEngineProd:
         self.vector_store = VectorStore(self.cfg, self.openai_client)
 
         # ── Checkpointer (PostgresSaver or MemorySaver) ──────────────────
-        self.checkpointer = MemorySaver()
-        logger.info("Checkpointer: MemorySaver")
+        # FIX: config_manager.get_checkpoint_config() already returns a
+        # proper Postgres connection string whenever Supabase is
+        # configured, but this was never actually consulted — every
+        # deployment silently ran on MemorySaver, meaning every audit
+        # session (including in-progress revisions) was lost on any
+        # Render restart or redeploy. Now we use PostgresSaver whenever
+        # Supabase is configured, and fall back to MemorySaver only for
+        # local dev with no Supabase set up.
+        self.checkpointer = self._build_checkpointer()
 
         # ── Per-hospital data adapters (lazy, cached) ─────────────────
         self._adapters: dict[str, object] = {}
@@ -427,6 +518,78 @@ class MIRAEngineProd:
 
         # ── Build tools + graph ───────────────────────────────────────────
         self._build_tools()
+        self._build_graph()
+
+    def _build_checkpointer(self):
+        ckpt_cfg = self.cfg.get_checkpoint_config()
+        self._ckpt_cfg = ckpt_cfg  # saved for auto-reconnect
+        if ckpt_cfg.get("type") == "postgres":
+            conn_string = ckpt_cfg["connection_string"]
+
+            # Supabase's connection pooler (PgBouncer in transaction mode)
+            # is incompatible with PostgresSaver — it blocks prepared
+            # statements, DDL, and pipeline mode, all of which the library
+            # requires.  Detect pooler URLs and skip straight to MemorySaver.
+            if "pooler.supabase.com" in conn_string or ":6543/" in conn_string:
+                logger.info(
+                    "Checkpointer: MemorySaver (Supabase pooler detected — "
+                    "PostgresSaver requires a direct connection on port 5432, "
+                    "not the PgBouncer pooler on port 6543)"
+                )
+                return MemorySaver()
+
+            # Non-pooler Postgres URL — try PostgresSaver normally.
+            try:
+                from langgraph.checkpoint.postgres import PostgresSaver
+                saver_ctx = PostgresSaver.from_conn_string(conn_string)
+                saver = saver_ctx.__enter__()
+                saver.setup()
+                logger.info("Checkpointer: PostgresSaver (direct Postgres)")
+                return saver
+            except ImportError:
+                logger.warning(
+                    "'langgraph-checkpoint-postgres' is not installed. "
+                    "Falling back to MemorySaver."
+                )
+            except Exception as e:
+                logger.warning(
+                    f"Failed to initialize PostgresSaver ({e}). "
+                    "Falling back to MemorySaver."
+                )
+        logger.info("Checkpointer: MemorySaver")
+        return MemorySaver()
+
+    @staticmethod
+    def _is_conn_error(exc: Exception) -> bool:
+        """Return True if the exception looks like a stale/dead Postgres connection."""
+        msg = str(exc).lower()
+        return any(phrase in msg for phrase in (
+            "connection is closed",
+            "connection already closed",
+            "server closed the connection",
+            "connection was reset",
+            "broken pipe",
+            "connection timed out",
+            "ssl connection has been closed",
+        ))
+
+    def _reconnect_checkpointer(self):
+        """Tear down the stale checkpointer, build a fresh one, and
+        recompile the graph so every subsequent call uses the new
+        connection. This is only needed for single-connection
+        PostgresSaver — a pooled checkpointer heals itself."""
+        logger.warning("Postgres connection lost — rebuilding checkpointer and graph")
+        try:
+            # Try to close the old connection cleanly (ignore errors)
+            old = getattr(self, 'checkpointer', None)
+            if old and hasattr(old, 'conn') and old.conn and not old.conn.closed:
+                try:
+                    old.conn.close()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        self.checkpointer = self._build_checkpointer()
         self._build_graph()
 
     # ── Data adapter per hospital ────────────────────────────────────────
@@ -1129,14 +1292,143 @@ Respond ONLY in JSON:
     def new_thread(self) -> dict:
         return {"configurable": {"thread_id": str(uuid.uuid4())}}
 
+    def transcribe_voice_query(self, audio_bytes: bytes, filename: str,
+                               spoken_language: str = "english",
+                               user_id: str = "", hospital_id: str = "") -> dict:
+        """
+        Transcribes a recorded clinical question, with support for auto-detection
+        and explicit English, Hindi, and Gujarati input.
+
+        When spoken_language="auto", Whisper auto-detects the language.
+        For non-English audio we use Whisper's /translations endpoint,
+        which always outputs English text regardless of the spoken
+        language — this is deliberate: everything downstream (SQL
+        generation, the condition vocabulary, patient-ID extraction) only
+        understands English medical terms, so translation happens once,
+        here, rather than requiring every agent to be multilingual-aware.
+
+        Returns:
+            {
+              "clinical_question": <English text to feed the pipeline>,
+              "original_transcript": <verbatim transcript in the spoken
+                                       language, kept for audit trail>,
+              "spoken_language": <detected or specified language>,
+              "detected_language": <language name if auto-detected>,
+              "error": <str, only present on failure>,
+            }
+
+        The original_transcript is always preserved, even when translated,
+        so a clinician or auditor can later see exactly what was said —
+        never just the machine-translated version.
+        """
+        spoken_language = (spoken_language or "english").lower()
+        is_auto_detect = spoken_language == "auto"
+        start = time.monotonic()
+
+        # Determine MIME type from filename for the Whisper API
+        _ext = (filename or "query.webm").rsplit(".", 1)[-1].lower()
+        _mime_map = {"wav": "audio/wav", "mp3": "audio/mpeg", "m4a": "audio/mp4",
+                     "ogg": "audio/ogg", "webm": "audio/webm", "flac": "audio/flac"}
+        _mime = _mime_map.get(_ext, "audio/webm")
+        _fname = filename or "query.webm"
+
+        def _make_audio_file():
+            """Return a fresh file-tuple for each Whisper API call.
+            Each call consumes the BytesIO stream, so we must create a new one."""
+            return (_fname, io.BytesIO(audio_bytes), _mime)
+
+        try:
+
+            if is_auto_detect:
+                # Auto-detect: transcribe without language constraint,
+                # then auto-translate to English if needed.
+                # FIX: the default response_format ("json") does NOT include
+                # a `language` field at all, so the old code's
+                # `getattr(verbatim_resp, "language", None)` always fell back
+                # to "en" — meaning detected_language was reported as English
+                # for every recording, and the `!= "en"` check below never
+                # triggered translation. Hindi/Gujarati audio was silently
+                # sent downstream untranslated, breaking the whole feature.
+                # response_format="verbose_json" is required to get `language`
+                # back at all. Note Whisper returns the FULL language name in
+                # lowercase English (e.g. "english", "hindi", "gujarati"), not
+                # an ISO code — so we compare against that, not "en".
+                verbatim_resp = self.openai_client.audio.transcriptions.create(
+                    model="whisper-1", file=_make_audio_file(), response_format="verbose_json"
+                )
+                detected_lang = (getattr(verbatim_resp, "language", None) or "english").lower()
+                original_text = verbatim_resp.text.strip()
+
+                # If Whisper detected non-English, translate to English
+                if detected_lang not in ("english", "en"):
+                    translated_resp = self.openai_client.audio.translations.create(
+                        model="whisper-1", file=_make_audio_file()
+                    )
+                    english_text = translated_resp.text.strip()
+                else:
+                    english_text = original_text
+
+                result = {
+                    "clinical_question": english_text,
+                    "original_transcript": original_text,
+                    "spoken_language": "auto",
+                    "detected_language": detected_lang,
+                }
+            elif spoken_language == "english":
+                resp = self.openai_client.audio.transcriptions.create(
+                    model="whisper-1", file=_make_audio_file(), language="en"
+                )
+                text = resp.text.strip()
+                result = {"clinical_question": text, "original_transcript": text,
+                         "spoken_language": spoken_language}
+            else:
+                # Explicit non-English language: get verbatim + translated
+                lang_code = VOICE_LANGUAGE_CODES.get(spoken_language, "en")
+                # Get the verbatim transcript (for the audit trail) AND the
+                # English translation (for the pipeline) — two calls, but
+                # each is cheap, and correctness/auditability here matters
+                # more than saving one Whisper call.
+                verbatim_resp = self.openai_client.audio.transcriptions.create(
+                    model="whisper-1", file=_make_audio_file(), language=lang_code
+                )
+                translated_resp = self.openai_client.audio.translations.create(
+                    model="whisper-1", file=_make_audio_file()
+                )
+                result = {
+                    "clinical_question": translated_resp.text.strip(),
+                    "original_transcript": verbatim_resp.text.strip(),
+                    "spoken_language": spoken_language,
+                }
+
+            duration = int((time.monotonic() - start) * 1000)
+            self.audit.log_tool_call("voice_transcription", "", duration, 1, True)
+            return result
+
+        except Exception as e:
+            duration = int((time.monotonic() - start) * 1000)
+            self.audit.log_tool_call("voice_transcription", "", duration, 0, False, str(e))
+            return {"clinical_question": "", "original_transcript": "",
+                    "spoken_language": spoken_language, "error": str(e)}
+
     def run_until_review(self, clinical_question: str, config: dict,
                          user_id: str = "anon", hospital_id: str = "demo",
-                         session_id: str = "") -> MIRAState:
-        initial = make_initial_state(clinical_question, user_id, hospital_id, session_id)
+                         session_id: str = "",
+                         input_mode: str = "text",
+                         spoken_language: str = "",
+                         original_transcript: str = "") -> MIRAState:
+        initial = make_initial_state(clinical_question, user_id, hospital_id, session_id,
+                                     input_mode=input_mode, spoken_language=spoken_language,
+                                     original_transcript=original_transcript)
         self.audit.log_query(user_id, hospital_id, session_id,
                              config["configurable"]["thread_id"],
                              clinical_question, len(clinical_question))
-        return self.graph.invoke(initial, config)
+        try:
+            return self.graph.invoke(initial, config)
+        except Exception as exc:
+            if self._is_conn_error(exc):
+                self._reconnect_checkpointer()
+                return self.graph.invoke(initial, config)
+            raise
 
     def submit_human_decision(self, config: dict, decision: str,
                                feedback: str = "",
@@ -1149,8 +1441,16 @@ Respond ONLY in JSON:
         try:
             snapshot = self.graph.get_state(config)
             current_state = dict(snapshot.values or {})
-        except Exception:
-            current_state = {}
+        except Exception as exc:
+            if self._is_conn_error(exc):
+                self._reconnect_checkpointer()
+                try:
+                    snapshot = self.graph.get_state(config)
+                    current_state = dict(snapshot.values or {})
+                except Exception:
+                    current_state = {}
+            else:
+                current_state = {}
 
         # MemorySaver lost state (e.g. a process restart). FIX: only trust
         # a frontend-supplied paused_state if it actually matches the
@@ -1226,7 +1526,14 @@ Respond ONLY in JSON:
             revised_state["human_decision"] = ""
             revised_state["human_feedback"] = ""
 
-            self.graph.update_state(config, revised_state)
+            try:
+                self.graph.update_state(config, revised_state)
+            except Exception as exc:
+                if self._is_conn_error(exc):
+                    self._reconnect_checkpointer()
+                    self.graph.update_state(config, revised_state)
+                else:
+                    raise
             self.audit.log_human_review(user_id, thread_id, decision, True, hospital_id)
 
             # Return exactly what's now persisted, so caller and checkpoint
@@ -1236,16 +1543,38 @@ Respond ONLY in JSON:
             except Exception:
                 return revised_state
 
-        self.graph.update_state(config, {
-            "human_decision": decision,
-            "human_feedback": feedback,
-        })
+        try:
+            self.graph.update_state(config, {
+                "human_decision": decision,
+                "human_feedback": feedback,
+            })
+        except Exception as exc:
+            if self._is_conn_error(exc):
+                self._reconnect_checkpointer()
+                self.graph.update_state(config, {
+                    "human_decision": decision,
+                    "human_feedback": feedback,
+                })
+            else:
+                raise
         self.audit.log_human_review(user_id, thread_id, decision,
                                     bool(feedback), hospital_id)
-        return self.graph.invoke(None, config)
+        try:
+            return self.graph.invoke(None, config)
+        except Exception as exc:
+            if self._is_conn_error(exc):
+                self._reconnect_checkpointer()
+                return self.graph.invoke(None, config)
+            raise
 
     def get_current_state(self, config: dict) -> MIRAState:
-        return self.graph.get_state(config).values
+        try:
+            return self.graph.get_state(config).values
+        except Exception as exc:
+            if self._is_conn_error(exc):
+                self._reconnect_checkpointer()
+                return self.graph.get_state(config).values
+            raise
 
     # ══════════════════════════════════════════════════════════════════
     # NEW PUBLIC API

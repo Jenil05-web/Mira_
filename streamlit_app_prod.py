@@ -47,6 +47,23 @@ FIXES IN THIS VERSION (aligned with the enhanced mira_pipeline_prod.py)
 5. SAFETY FLAGS WERE SHOWN AS RAW, UNEXPLAINED STRINGS
    Fixed: flags are now mapped to short, human-readable explanations.
 
+6. MULTILINGUAL VOICE INPUT (English / Hindi / Gujarati) — AUTO-DETECT
+   A "dictate your query" panel using `engine.transcribe_voice_query()`.
+   Spoken language is auto-detected server-side (no manual selector) and
+   non-English speech is translated to English before reaching the
+   pipeline. The verbatim transcript in the original language, plus the
+   detected language, is preserved and shown in "View data sources".
+
+7. SESSION-STATE WIDGET MUTATION BUG FIXED
+   Streamlit forbids writing to `st.session_state.question_input` after
+   the `question_input` widget has already been instantiated in the same
+   script run. Directly assigning to it inside the transcribe handler
+   (which runs *after* the text_area was created higher up on the page)
+   raised StreamlitAPIException. Fixed: the transcribed text is now
+   staged in a separate `_pending_question_text` key, which is drained
+   into `question_input` at the very top of the script — before the
+   widget is created — then the page reruns cleanly.
+
 Run with: streamlit run streamlit_app_prod.py
 """
 
@@ -312,6 +329,32 @@ div[data-testid="stButton"] button[kind="primary"]:hover { background: #0F1A1F !
 .empty-state .heading { font-family: 'Newsreader', serif; font-size: 18px; font-weight: 500; color: var(--ink); margin-bottom: 8px; }
 .empty-state .sub { font-size: 13.5px; color: var(--slate); max-width: 380px; margin: 0 auto; line-height: 1.65; }
 
+/* VOICE / MIC PANEL */
+.mic-panel {
+    background: linear-gradient(145deg, var(--surface) 0%, var(--teal-tint) 130%);
+    border: 1px solid var(--line); border-radius: 14px;
+    padding: 18px 20px; margin-top: 4px;
+}
+.mic-panel-head { display: flex; align-items: center; gap: 10px; margin-bottom: 4px; }
+.mic-icon-badge {
+    width: 34px; height: 34px; border-radius: 10px; background: var(--ink);
+    display: flex; align-items: center; justify-content: center; font-size: 15px;
+    flex-shrink: 0;
+}
+.mic-panel-title { font-size: 13.5px; font-weight: 600; color: var(--ink); }
+.mic-panel-sub { font-size: 12px; color: var(--slate); margin-top: 1px; }
+.mic-result-chip {
+    display: inline-flex; align-items: center; gap: 7px; margin-top: 12px;
+    background: var(--teal-tint); border: 1px solid rgba(45,140,127,0.22);
+    border-radius: 100px; padding: 6px 13px 6px 11px; font-size: 12px; color: var(--teal-deep);
+}
+.mic-result-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--teal); flex-shrink: 0; }
+.mic-transcript-box {
+    margin-top: 8px; font-size: 12.5px; color: var(--slate); line-height: 1.6;
+    background: var(--line-soft); border: 1px solid var(--line); border-radius: 8px;
+    padding: 10px 13px;
+}
+
 hr { border-color: var(--line) !important; }
 </style>
 """
@@ -399,6 +442,14 @@ def init_session():
         # the run kicks off, but submit_human_decision needs the original
         # question throughout the entire audit (approve, reject, revise).
         "current_question": "",
+        # NEW — voice input (auto-detected language, no manual selector)
+        "voice_original_transcript": "",       # verbatim transcript, kept for audit trail
+        "voice_spoken_language": "",            # language auto-detected server-side
+        "current_input_mode": "text",           # "text" | "voice" — for the current/last audit
+        # FIX: staging key used to push transcribed text into the
+        # question_input widget *before* it is instantiated, since
+        # Streamlit forbids writing to a widget's key after creation.
+        "_pending_question_text": None,
     }
     for key, val in defaults.items():
         if key not in st.session_state:
@@ -417,6 +468,11 @@ def reset_audit_session():
     st.session_state.current_question = ""
     st.session_state.show_feedback_box = False
     st.session_state.pop("feedback_box", None)
+    st.session_state.voice_original_transcript = ""
+    st.session_state.voice_spoken_language = ""
+    st.session_state.current_input_mode = "text"
+    st.session_state.pop("question_input", None)
+    st.session_state._pending_question_text = None
 
 
 # Call to initialise session state
@@ -516,6 +572,22 @@ else:
 # ══════════════════════════════════════════════════════════════════════════
 # HELPERS
 # ══════════════════════════════════════════════════════════════════════════
+
+# Display labels for auto-detected spoken language codes. Falls back to a
+# capitalized raw string for anything not in this map, so we never need to
+# widen this list to keep the UI working.
+_LANG_LABELS = {
+    "english": "English", "en": "English",
+    "hindi": "हिन्दी (Hindi)", "hi": "हिन्दी (Hindi)",
+    "gujarati": "ગુજરાતી (Gujarati)", "gu": "ગુજરાતી (Gujarati)",
+}
+
+
+def _lang_label(code: str) -> str:
+    if not code:
+        return ""
+    return _LANG_LABELS.get(code.lower(), code.capitalize())
+
 
 def render_fill_rail(stage: str):
     nodes = [
@@ -656,7 +728,16 @@ def render_data_sources_expander(active: dict):
     patient existence detail so a clinician can see *why* the pipeline
     made the choices it made, instead of a report appearing from nowhere."""
     with st.expander("View data sources used"):
-        st.markdown('<div class="panel-eyebrow">SQL QUERY EXECUTED</div>', unsafe_allow_html=True)
+        if active.get("input_mode") == "voice" and active.get("original_transcript"):
+            spoken = _lang_label(active.get("spoken_language", "")) or "auto-detected language"
+            st.markdown('<div class="panel-eyebrow">VOICE INPUT</div>', unsafe_allow_html=True)
+            st.markdown(
+                f'<div style="font-size:13px;color:#5C7A89;">Spoken in <strong style="color:#1C2B33;">'
+                f'{spoken}</strong>: \u201c{active["original_transcript"]}\u201d</div>',
+                unsafe_allow_html=True
+            )
+
+        st.markdown('<div class="panel-eyebrow" style="margin-top:16px;">SQL QUERY EXECUTED</div>', unsafe_allow_html=True)
         st.markdown(f'<div class="mono-block">{active.get("sql_query_used","—")}</div>', unsafe_allow_html=True)
 
         intent = active.get("query_intent") or {}
@@ -735,6 +816,14 @@ with tab_audit:
         st.markdown('<div class="panel-eyebrow with-dot"><span class="eyebrow-dot"></span>CLINICAL QUERY</div>',
                     unsafe_allow_html=True)
 
+        # FIX: drain any transcribed text staged by the voice-input handler
+        # into the question_input widget's state *before* the widget below
+        # is instantiated. Writing to st.session_state.question_input after
+        # the widget exists raises StreamlitAPIException — this runs first.
+        if st.session_state.get("_pending_question_text") is not None:
+            st.session_state.question_input = st.session_state._pending_question_text
+            st.session_state._pending_question_text = None
+
         question = st.text_area(
             label="Clinical query",
             placeholder="e.g. Which patients show signs of AKI based on their latest labs?",
@@ -745,6 +834,96 @@ with tab_audit:
         st.markdown('<div class="chip-row">' +
                     "".join(f'<span class="chip">{q}</span>' for q in EXAMPLE_QUESTIONS) +
                     '</div>', unsafe_allow_html=True)
+        st.write("")
+
+        # ── Voice input — auto-detected language (English / Hindi / Gujarati) ──
+        # Spoken language is auto-detected server-side; whatever isn't
+        # English is translated before reaching the pipeline, since the SQL
+        # and condition-vocabulary agents only understand English medical
+        # terms. The verbatim transcript in the original language is always
+        # kept and shown for audit purposes.
+        _controls_disabled = st.session_state.stage in ["running", "awaiting_review"]
+
+        with st.expander("🎙️  Dictate your query — language is detected automatically"):
+            st.markdown(f"""
+            <div class="mic-panel">
+                <div class="mic-panel-head">
+                    <div class="mic-icon-badge">🎙️</div>
+                    <div>
+                        <div class="mic-panel-title">Speak your clinical question</div>
+                        <div class="mic-panel-sub">English, Hindi, or Gujarati — no need to pick a language</div>
+                    </div>
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
+            st.write("")
+
+            audio_bytes, audio_filename = None, "query.webm"
+            try:
+                audio_value = st.audio_input("Record your question", key="voice_recorder",
+                                             disabled=_controls_disabled,
+                                             label_visibility="collapsed")
+                if audio_value is not None:
+                    audio_bytes = audio_value.getvalue()
+                    # st.audio_input records in webm format — the filename
+                    # extension must match so Whisper decodes it correctly.
+                    audio_filename = "query.webm"
+            except AttributeError:
+                # Older Streamlit versions don't have st.audio_input — fall
+                # back to a file upload so this still works everywhere.
+                uploaded_audio = st.file_uploader(
+                    "Upload a short audio clip (wav / mp3 / m4a / ogg / webm)",
+                    type=["wav", "mp3", "m4a", "ogg", "webm"], key="voice_uploader",
+                    disabled=_controls_disabled,
+                )
+                if uploaded_audio is not None:
+                    audio_bytes = uploaded_audio.getvalue()
+                    audio_filename = uploaded_audio.name
+
+            transcribe_clicked = st.button(
+                "✦ Transcribe and use as query", use_container_width=True, type="primary",
+                disabled=(audio_bytes is None or _controls_disabled),
+            )
+
+            if transcribe_clicked and audio_bytes:
+                ph = st.empty()
+                with ph.container():
+                    render_processing_strip("Detecting language and transcribing")
+                try:
+                    result = engine.transcribe_voice_query(
+                        audio_bytes, audio_filename, spoken_language="auto",
+                        user_id=user.user_id, hospital_id=user.hospital_id,
+                    )
+                except Exception as exc:
+                    result = {"error": str(exc)}
+                ph.empty()
+                if result.get("error"):
+                    st.error(f"Transcription failed: {result['error']}")
+                elif not result.get("clinical_question"):
+                    st.warning("No speech detected — please try recording again.")
+                else:
+                    # FIX: stage the value instead of writing directly to
+                    # st.session_state.question_input here — the widget
+                    # already exists this run. It gets drained at the top
+                    # of the script on the rerun triggered below.
+                    st.session_state._pending_question_text = result["clinical_question"]
+                    st.session_state.voice_original_transcript = result.get("original_transcript", "")
+                    st.session_state.voice_spoken_language = result.get("detected_language") or result.get("spoken_language", "")
+                    st.session_state.current_input_mode = "voice"
+                    st.rerun()
+
+            if (st.session_state.get("voice_original_transcript")
+                    and st.session_state.get("current_input_mode") == "voice"):
+                spoken = _lang_label(st.session_state.voice_spoken_language) or "Detected language"
+                st.markdown(f"""
+                <div class="mic-result-chip">
+                    <span class="mic-result-dot"></span>Detected: {spoken}
+                </div>
+                <div class="mic-transcript-box">
+                    \u201c{st.session_state.voice_original_transcript}\u201d
+                </div>
+                """, unsafe_allow_html=True)
+
         st.write("")
 
         run_disabled = st.session_state.stage in ["running", "awaiting_review"] or not question.strip()
@@ -931,6 +1110,9 @@ with tab_audit:
                 user_id=user.user_id,
                 hospital_id=user.hospital_id,
                 session_id=st.session_state.session_id,
+                input_mode=st.session_state.get("current_input_mode", "text"),
+                spoken_language=st.session_state.get("voice_spoken_language", ""),
+                original_transcript=st.session_state.get("voice_original_transcript", ""),
             )
             ph.empty()
 
