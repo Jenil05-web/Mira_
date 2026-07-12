@@ -1079,6 +1079,28 @@ with tab_audit:
             render_report_panel(state.get("final_report", "No report generated."))
             
             # ── Export as Word/PDF ───────────────────────────────────────
+            # Style the export buttons: remove hover, set distinct color
+            st.markdown("""
+            <style>
+            div[data-testid="stDownloadButton"] button {
+                background-color: #5C7A89 !important;
+                color: #FFFFFF !important;
+                border: none !important;
+                box-shadow: none !important;
+                transition: none !important;
+            }
+            div[data-testid="stDownloadButton"] button:hover,
+            div[data-testid="stDownloadButton"] button:active,
+            div[data-testid="stDownloadButton"] button:focus {
+                background-color: #5C7A89 !important;
+                color: #FFFFFF !important;
+                border: none !important;
+                box-shadow: none !important;
+                transform: none !important;
+            }
+            </style>
+            """, unsafe_allow_html=True)
+            
             # MS Word can seamlessly open HTML files saved as .doc
             html_report = f"""<html><head><meta charset="utf-8"></head>
             <body><h2>MIRA Clinical Report</h2>
@@ -1086,12 +1108,33 @@ with tab_audit:
             <br><p><small>Generated on {time.strftime('%Y-%m-%d %H:%M:%S')}</small></p>
             </body></html>"""
             
-            export_col1, export_col2, _ = st.columns([1, 1, 2])
+            def _create_simple_pdf(text_content):
+                """Minimal, zero-dependency PDF generator for demo purposes."""
+                lines = text_content.replace('\r', '').split('\n')
+                pdf = b"%PDF-1.4\n1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>\nendobj\n4 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n"
+                stream = b"BT\n/F1 10 Tf\n10 750 Td\n"
+                for line in lines[:55]:  # fit to 1 page
+                    clean = ''.join(c for c in line if 32 <= ord(c) <= 126)
+                    clean = clean.replace('\\', '\\\\').replace('(', '\\(').replace(')', '\\)')
+                    stream += f"({clean}) Tj\n0 -12 Td\n".encode('ascii')
+                stream += b"ET"
+                pdf += f"5 0 obj\n<< /Length {len(stream)} >>\nstream\n".encode('ascii')
+                pdf += stream
+                pdf += b"\nendstream\nendobj\nxref\n0 6\n0000000000 65535 f \n0000000009 00000 n \n0000000058 00000 n \n0000000115 00000 n \n0000000224 00000 n \n0000000311 00000 n \ntrailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n405\n%%EOF\n"
+                return pdf
+
+            pdf_report = _create_simple_pdf(f"MIRA Clinical Report\n\n{state.get('final_report', '')}\n\nGenerated: {time.strftime('%Y-%m-%d')}")
+            
+            export_col1, export_col2, export_col3, _ = st.columns([1.2, 1.2, 1.2, 1.5])
             with export_col1:
                 st.download_button("Export as Word (.doc)", data=html_report, 
                                    file_name=f"MIRA_Report_{int(time.time())}.doc", 
                                    mime="application/msword")
             with export_col2:
+                st.download_button("Export as PDF (.pdf)", data=pdf_report, 
+                                   file_name=f"MIRA_Report_{int(time.time())}.pdf", 
+                                   mime="application/pdf")
+            with export_col3:
                 if st.button("Start a new audit"):
                     reset_audit_session()
                     st.rerun()
