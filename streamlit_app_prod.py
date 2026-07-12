@@ -563,9 +563,9 @@ st.markdown(f"""
 # ══════════════════════════════════════════════════════════════════════════
 
 if user.can("view_audit_log"):
-    tab_audit, tab_admin = st.tabs(["Clinical Audit", "Admin"])
+    tab_audit, tab_triage, tab_admin = st.tabs(["Clinical Audit", "Live Triage Dashboard", "Admin"])
 else:
-    tab_audit = st.container()
+    tab_audit, tab_triage = st.tabs(["Clinical Audit", "Live Triage Dashboard"])
     tab_admin = None
 
 
@@ -1077,10 +1077,24 @@ with tab_audit:
                         unsafe_allow_html=True)
             render_trend_chart(state.get("trend_data", ""))
             render_report_panel(state.get("final_report", "No report generated."))
-
-            if st.button("Start a new audit"):
-                reset_audit_session()
-                st.rerun()
+            
+            # ── Export as Word/PDF ───────────────────────────────────────
+            # MS Word can seamlessly open HTML files saved as .doc
+            html_report = f"""<html><head><meta charset="utf-8"></head>
+            <body><h2>MIRA Clinical Report</h2>
+            {md_lib.markdown(state.get("final_report", "No report generated."))}
+            <br><p><small>Generated on {time.strftime('%Y-%m-%d %H:%M:%S')}</small></p>
+            </body></html>"""
+            
+            export_col1, export_col2, _ = st.columns([1, 1, 2])
+            with export_col1:
+                st.download_button("Export as Word (.doc)", data=html_report, 
+                                   file_name=f"MIRA_Report_{int(time.time())}.doc", 
+                                   mime="application/msword")
+            with export_col2:
+                if st.button("Start a new audit"):
+                    reset_audit_session()
+                    st.rerun()
 
     # ══════════════════════════════════════════════════════════════════════
     # RUN HANDLER
@@ -1120,6 +1134,62 @@ with tab_audit:
         st.session_state.paused_state = paused
         st.session_state.stage = "awaiting_review"
         st.rerun()
+
+# ══════════════════════════════════════════════════════════════════════════
+# TAB 2 — LIVE TRIAGE DASHBOARD (Multi-patient & Monitoring)
+# ══════════════════════════════════════════════════════════════════════════
+
+if tab_triage:
+    with tab_triage:
+        st.markdown('<div style="height:12px;"></div>', unsafe_allow_html=True)
+        col1, col2 = st.columns([3, 1])
+        with col1:
+            st.markdown("<h3>Proactive Triage Dashboard</h3>", unsafe_allow_html=True)
+            st.markdown("<p style='color:#5C7A89;'>Automatically scans all available patient data to surface critical risks, ranked by severity.</p>", unsafe_allow_html=True)
+        with col2:
+            auto_refresh = st.toggle("Enable Live Monitoring (Auto-scans every 30s)")
+            if st.button("Run Manual Scan Now", type="primary", use_container_width=True):
+                st.session_state.last_triage = None
+        
+        # We cache the triage result in session_state so it doesn't run on every UI tweak
+        if "last_triage" not in st.session_state:
+            st.session_state.last_triage = None
+            
+        should_run = (st.session_state.last_triage is None) or auto_refresh
+        
+        if should_run:
+            with st.spinner("Scanning hospital records & calculating severity..."):
+                st.session_state.last_triage = engine.run_triage(user.hospital_id, limit=60)
+            
+        triage_data = st.session_state.last_triage
+        
+        if not triage_data:
+            st.info("No critical patients detected at this time.")
+        else:
+            for patient in triage_data:
+                score = patient.get("severity_score", 0)
+                color = "#C9501F" if score >= 8 else ("#B98A2E" if score >= 5 else "#2D8C7F")
+                st.markdown(f"""
+                <div style="background:#fff; border-left: 4px solid {color}; border-top: 1px solid #E7E9E4; border-right: 1px solid #E7E9E4; border-bottom: 1px solid #E7E9E4; border-radius: 8px; padding: 16px; margin-bottom: 12px;">
+                    <div style="display:flex; justify-content:space-between; align-items:center;">
+                        <span style="font-weight:600; font-size:16px;">Patient ID: {patient.get('subject_id', 'Unknown')}</span>
+                        <span style="background:{color}15; color:{color}; padding: 4px 10px; border-radius: 100px; font-weight:600; font-size:14px;">Severity: {score}/10</span>
+                    </div>
+                    <div style="margin-top: 12px; font-size: 14.5px; color:#1C2B33;">
+                        <strong>Risk:</strong> {patient.get('reason', '')}
+                    </div>
+                    <div style="margin-top: 8px; font-size: 13.5px; color:#5C7A89; background:#F9FAFB; padding: 10px; border-radius: 6px;">
+                        <strong>Critical Labs:</strong> {patient.get('labs', '')}
+                    </div>
+                </div>
+                """, unsafe_allow_html=True)
+                
+        if auto_refresh:
+            time.sleep(30)
+            st.session_state.last_triage = None
+            st.rerun()
+
+
 
 
 # ══════════════════════════════════════════════════════════════════════════

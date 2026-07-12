@@ -231,10 +231,18 @@ class DevUserStore:
                 hospital_id="demo_hospital",
                 display_name="MIRA Admin",
             ),
+            "fhir@mira.dev": User(
+                user_id="dev_fhir_001",
+                email="fhir@mira.dev",
+                role=Role.CLINICIAN,
+                hospital_id="hapi_fhir_hospital",
+                display_name="Dr. FHIR Sandbox",
+            ),
         }
         self._passwords = {
             "clinician@mira.dev": pm.hash("mira_clinician_2024"),
             "admin@mira.dev":     pm.hash("mira_admin_2024"),
+            "fhir@mira.dev":      pm.hash("mira_fhir_2024"),
         }
 
     def authenticate(self, email: str, password: str) -> Optional[User]:

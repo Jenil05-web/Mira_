@@ -315,6 +315,173 @@ AND {value_col} IS NOT NULL
 ORDER BY {time_col} DESC
 LIMIT 25"""
 
+    # ── Canonical-format interface (used by mira_pipeline_prod.py) ────────
+    # These methods let the pipeline call any adapter — DB or FHIR —
+    # through the same API and always get {"rows": [...]} back in one
+    # canonical shape: subject_id, gender, age, lab_name, valuenum,
+    # valueuom, ref_range_lower, ref_range_upper, flag, charttime.
+
+    def check_patients_exist(self, patient_ids: list) -> tuple[list, list]:
+        """Schema-agnostic patient existence check.  Returns (found, missing)."""
+        if not self._table_map:
+            self.discover_schema()
+
+        patient_info = self._table_map.get("patients", {})
+        if not patient_info:
+            return [], list(patient_ids)
+
+        table = patient_info["table"]
+        id_col = patient_info.get("columns", {}).get("patient_id", "subject_id")
+
+        found, missing = [], []
+        for pid in patient_ids:
+            try:
+                with self.engine.connect() as conn:
+                    row = conn.execute(
+                        text(f"SELECT {id_col} FROM {table} WHERE {id_col} = :pid LIMIT 1"),
+                        {"pid": pid},
+                    ).fetchone()
+                    (found if row else missing).append(pid)
+            except Exception:
+                missing.append(pid)
+        return found, missing
+
+    def _canonical_select_parts(self) -> tuple:
+        """Internal helper — returns (select_clause, from_join_clause)
+        built entirely from the concept map."""
+        if not self._table_map:
+            self.discover_schema()
+
+        lab  = self._table_map.get("labevents", {})
+        pat  = self._table_map.get("patients", {})
+        dct  = self._table_map.get("lab_dict", {})
+        if not lab or not pat:
+            return None, None
+
+        lt, lc = lab["table"], lab.get("columns", {})
+        pt, pc = pat["table"], pat.get("columns", {})
+
+        l_pid  = lc.get("patient_id", "subject_id")
+        l_val  = lc.get("lab_valuenum", "valuenum")
+        l_uom  = lc.get("lab_unit", "valueuom")
+        l_rlo  = lc.get("ref_lower", "ref_range_lower")
+        l_rhi  = lc.get("ref_upper", "ref_range_upper")
+        l_flag = lc.get("lab_flag", "flag")
+        l_time = lc.get("chart_time", "charttime")
+        p_pid  = pc.get("patient_id", "subject_id")
+        p_gen  = pc.get("gender", "gender")
+        p_age  = pc.get("age", "anchor_age")
+
+        if dct:
+            dt, dc = dct["table"], dct.get("columns", {})
+            l_item = lc.get("lab_item_id", "itemid")
+            d_item = dc.get("lab_item_id", list(dc.values())[0] if dc else "itemid")
+            d_label = dc.get("lab_name", "label")
+            name_sel  = f"d.{d_label} AS lab_name"
+            dict_join = f"JOIN {dt} d ON l.{l_item} = d.{d_item}"
+        else:
+            l_name = lc.get("lab_name")
+            name_sel  = f"l.{l_name} AS lab_name" if l_name else "'unknown' AS lab_name"
+            dict_join = ""
+
+        select = (f"p.{p_pid} AS subject_id, p.{p_gen} AS gender, p.{p_age} AS age, "
+                  f"{name_sel}, l.{l_val} AS valuenum, l.{l_uom} AS valueuom, "
+                  f"l.{l_rlo} AS ref_range_lower, l.{l_rhi} AS ref_range_upper, "
+                  f"l.{l_flag} AS flag, l.{l_time} AS charttime")
+
+        from_join = (f"FROM {lt} l\n"
+                     f"JOIN {pt} p ON l.{l_pid} = p.{p_pid}\n"
+                     f"{dict_join}")
+
+        return select, from_join
+
+    def get_patient_labs(self, patient_ids: list, limit: int = 200) -> str:
+        """Schema-agnostic lab query for specific patients.
+        Returns canonical JSON ``{"rows": [...], "total_returned": N}``."""
+        sel, fj = self._canonical_select_parts()
+        if sel is None:
+            return json.dumps({"rows": [], "error": "Could not map lab/patient tables"})
+
+        lc  = self._table_map["labevents"].get("columns", {})
+        pc  = self._table_map["patients"].get("columns", {})
+        l_val  = lc.get("lab_valuenum", "valuenum")
+        l_time = lc.get("chart_time", "charttime")
+        p_pid  = pc.get("patient_id", "subject_id")
+
+        ids_csv = ",".join(str(int(p)) for p in patient_ids)
+        sql = (f"SELECT {sel}\n{fj}\n"
+               f"WHERE p.{p_pid} IN ({ids_csv})\n"
+               f"  AND l.{l_val} IS NOT NULL\n"
+               f"ORDER BY p.{p_pid}, l.{l_time} DESC\n"
+               f"LIMIT {int(limit)}")
+        return self.run_query(sql)
+
+    def get_broad_abnormal_labs(self, limit: int = 60) -> str:
+        """Schema-agnostic broad abnormal-labs query.  Returns canonical JSON."""
+        sql = self.get_abnormal_labs_query()
+        if sql.startswith("--"):
+            return json.dumps({"rows": [], "error": sql})
+        sql = re.sub(r"LIMIT\s+\d+", f"LIMIT {int(limit)}", sql, flags=re.IGNORECASE)
+        return self.run_query(sql)
+
+    def get_sql_prompt_instructions(self) -> str:
+        """Generate dynamic LLM-SQL prompt instructions from the concept map
+        so the LLM writes correct SQL for *this* hospital's schema."""
+        if not self._table_map:
+            self.discover_schema()
+
+        lab  = self._table_map.get("labevents", {})
+        pat  = self._table_map.get("patients", {})
+        dct  = self._table_map.get("lab_dict", {})
+        if not lab or not pat:
+            return ""
+
+        lt, lc = lab["table"], lab.get("columns", {})
+        pt, pc = pat["table"], pat.get("columns", {})
+
+        l_pid  = lc.get("patient_id", "subject_id")
+        l_val  = lc.get("lab_valuenum", "valuenum")
+        l_uom  = lc.get("lab_unit", "valueuom")
+        l_rlo  = lc.get("ref_lower", "ref_range_lower")
+        l_rhi  = lc.get("ref_upper", "ref_range_upper")
+        l_flag = lc.get("lab_flag", "flag")
+        l_time = lc.get("chart_time", "charttime")
+        p_pid  = pc.get("patient_id", "subject_id")
+        p_gen  = pc.get("gender", "gender")
+        p_age  = pc.get("age", "anchor_age")
+
+        lines = [f"- Use table aliases: {lt} l, {pt} p"]
+
+        sel_cols = (f"p.{p_pid} AS subject_id, p.{p_gen} AS gender, p.{p_age} AS age, ")
+
+        if dct:
+            dt, dc = dct["table"], dct.get("columns", {})
+            l_item  = lc.get("lab_item_id", "itemid")
+            d_item  = dc.get("lab_item_id", list(dc.values())[0] if dc else "itemid")
+            d_label = dc.get("lab_name", "label")
+            lines[0] += f", {dt} d"
+            lines.append(f"- Always JOIN {dt} d ON l.{l_item} = d.{d_item}")
+            lines.append(f"- Always JOIN {pt} p ON l.{l_pid} = p.{p_pid}")
+            sel_cols += f"d.{d_label} AS lab_name, "
+            lines.append(f"- For lab names use LIKE e.g. d.{d_label} ILIKE '%creatinine%'")
+        else:
+            l_name = lc.get("lab_name")
+            lines.append(f"- Always JOIN {pt} p ON l.{l_pid} = p.{p_pid}")
+            if l_name:
+                sel_cols += f"l.{l_name} AS lab_name, "
+
+        sel_cols += (f"l.{l_val} AS valuenum, l.{l_uom} AS valueuom, "
+                     f"l.{l_rlo} AS ref_range_lower, l.{l_rhi} AS ref_range_upper, "
+                     f"l.{l_flag} AS flag, l.{l_time} AS charttime")
+
+        lines.append(f"- ALWAYS include in SELECT: {sel_cols}")
+        lines.append(f"- WHERE l.{l_val} IS NOT NULL always")
+        return "\n".join(lines)
+
+    def results_to_sql_format(self, rows: list) -> str:
+        """Wrap rows in canonical MIRA JSON.  Matches FHIRAdapter.results_to_sql_format()."""
+        return json.dumps({"rows": rows, "total_returned": len(rows)}, default=str)
+
 
 # ══════════════════════════════════════════════════════════════════════════
 # ADAPTER FACTORY — picks FHIR or DB based on connection config

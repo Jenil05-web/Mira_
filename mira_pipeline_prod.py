@@ -145,6 +145,7 @@ from langgraph.checkpoint.memory import MemorySaver
 
 from config_manager import ConfigManager
 from db_adapter import DBAdapter, create_adapter
+from fhir_adapter import FHIRAdapter
 from audit_logger import AuditLogger
 from trend_agent import TrendAgent
 
@@ -684,38 +685,30 @@ class MIRAEngineProd:
         except Exception:
             return guidelines_json
 
-    # ── Patient existence check (used to avoid the "random patient" bug) ──
+    # ── Patient existence check (adapter-aware — works for any schema) ────
     def _check_patients_exist(self, patient_ids: list[int], hospital_id: str) -> tuple[list, list]:
-        """Returns (found_ids, missing_ids) by checking the patients table directly."""
-        found, missing = [], []
-        for pid in patient_ids:
-            try:
-                sql = f"SELECT subject_id FROM patients WHERE subject_id = {int(pid)} LIMIT 1"
-                result = self.sql_query_tool.invoke({"query": sql, "hospital_id": hospital_id})
-                rows = json.loads(result).get("rows", [])
-                (found if rows else missing).append(pid)
-            except Exception:
-                missing.append(pid)
-        return found, missing
+        """Returns (found_ids, missing_ids) via the adapter's concept-mapped
+        lookup — no hardcoded table/column names."""
+        adapter = self._get_adapter(hospital_id)
+        return adapter.check_patients_exist(patient_ids)
 
-    # ── SQL sub-handler: one or more SPECIFIC patient IDs requested ───────
+    # ── Sub-handler: one or more SPECIFIC patient IDs requested ────────────
     def _handle_specific_patient_query(self, state: MIRAState, intent: dict,
                                         hospital_id: str) -> MIRAState:
+        """Adapter-aware: calls adapter.get_patient_labs() which builds the
+        correct query for any DB schema, or fetches via FHIR — and always
+        returns canonical {"rows": [...]} format."""
         patient_ids = intent["patient_ids"]
         found_ids, missing_ids = self._check_patients_exist(patient_ids, hospital_id)
 
         if not found_ids:
-            # FIX: previously this silently fell back to an unrelated broad
-            # query and reported on a random different patient. Now we say
-            # plainly that the requested patient(s) weren't found — no
-            # unrelated data is substituted.
             empty_result = json.dumps({
                 "rows": [],
                 "requested_patient_ids": patient_ids,
                 "found_patient_ids": [],
                 "missing_patient_ids": missing_ids,
             })
-            self.audit.log_agent_run("sql_extractor", state.get("session_id", ""),
+            self.audit.log_agent_run("data_extractor", state.get("session_id", ""),
                                      0, True, rows_returned=0,
                                      user_id=state.get("user_id", ""), hospital_id=hospital_id)
             return {**state,
@@ -727,26 +720,14 @@ class MIRAEngineProd:
                     "found_patient_ids": [],
                     "missing_patient_ids": missing_ids}
 
-        ids_csv = ",".join(str(int(p)) for p in found_ids)
-        sql = f"""
-            SELECT p.subject_id, p.gender, p.anchor_age,
-                   d.label AS lab_name, l.valuenum, l.valueuom,
-                   l.ref_range_lower, l.ref_range_upper, l.flag, l.charttime
-            FROM labevents l
-            JOIN patients p ON l.subject_id = p.subject_id
-            JOIN d_labitems d ON l.itemid = d.itemid
-            WHERE p.subject_id IN ({ids_csv})
-              AND l.valuenum IS NOT NULL
-            ORDER BY p.subject_id, l.charttime DESC
-            LIMIT 200
-        """
+        adapter = self._get_adapter(hospital_id)
         start = time.monotonic()
-        result = self.sql_query_tool.invoke({"query": sql, "hospital_id": hospital_id})
-        parsed = json.loads(result) if not json.loads(result).get("error") else {"rows": []}
+        result = adapter.get_patient_labs(found_ids, limit=200)
+        parsed = json.loads(result)
         rows = parsed.get("rows", [])
         duration = int((time.monotonic() - start) * 1000)
 
-        data_status = "ok" if rows else "no_data"  # patient exists but no lab rows
+        data_status = "ok" if rows else "no_data"
         enriched = json.dumps({
             "rows": rows,
             "requested_patient_ids": patient_ids,
@@ -754,51 +735,79 @@ class MIRAEngineProd:
             "missing_patient_ids": missing_ids,
         }, default=str)
 
-        self.audit.log_agent_run("sql_extractor", state.get("session_id", ""),
+        source_label = "fhir" if isinstance(adapter, FHIRAdapter) else "sql"
+        self.audit.log_agent_run("data_extractor", state.get("session_id", ""),
                                  duration, True, rows_returned=len(rows),
                                  user_id=state.get("user_id", ""), hospital_id=hospital_id)
-        self.audit.log_data_access("sql", "lab_observations", len(rows),
+        self.audit.log_data_access(source_label, "lab_observations", len(rows),
                                    state.get("session_id", ""),
                                    state.get("user_id", ""), hospital_id)
 
-        return {**state, "sql_query_used": sql, "sql_result": enriched,
+        return {**state,
+                "sql_query_used": f"-- adapter.get_patient_labs({found_ids}) [{source_label}] --",
+                "sql_result": enriched,
                 "sql_error": "", "sql_retry_count": state.get("sql_retry_count", 0),
                 "data_status": data_status,
                 "requested_patient_ids": patient_ids,
                 "found_patient_ids": found_ids,
                 "missing_patient_ids": missing_ids}
 
-    # ── SQL sub-handler: general / list-style question ─────────────────────
+    # ── Sub-handler: general / list-style question ────────────────────────
     def _handle_general_query(self, state: MIRAState, intent: dict,
                                hospital_id: str, schema: str) -> MIRAState:
+        """Adapter-aware general-query handler.
+        • FHIR path  → calls adapter.get_broad_abnormal_labs() directly
+                        (no SQL generation, no LLM step for data extraction).
+        • SQL path   → uses LLM to generate schema-agnostic SQL via the
+                        adapter's concept-mapped prompt instructions, then
+                        falls back to adapter.get_broad_abnormal_labs().
+        Either path lands in the same canonical {"rows": [...]} shape."""
+        adapter = self._get_adapter(hospital_id)
         question = intent["raw_question"]
         retry_count = state.get("sql_retry_count", 0)
         conditions = intent.get("conditions", [])
+        start = time.monotonic()
+        is_fhir = isinstance(adapter, FHIRAdapter)
+
+        # ── FHIR path (no SQL at all) ──────────────────────────────────
+        if is_fhir:
+            result = adapter.get_broad_abnormal_labs(limit=60)
+            parsed = json.loads(result)
+            rows = parsed.get("rows", [])
+            duration = int((time.monotonic() - start) * 1000)
+            distinct_patients = {r.get("subject_id") for r in rows
+                                 if r.get("subject_id") is not None}
+            data_status = "ok" if rows else "no_data"
+            if intent["is_list"] and len(distinct_patients) < MIN_LIST_PATIENTS:
+                data_status = "list_insufficient"
+
+            enriched = json.dumps({
+                "rows": rows, "used_fallback_broad_query": False,
+            }, default=str)
+
+            self.audit.log_agent_run("data_extractor", state.get("session_id", ""),
+                                     duration, True, rows_returned=len(rows),
+                                     user_id=state.get("user_id", ""),
+                                     hospital_id=hospital_id)
+            self.audit.log_data_access("fhir", "lab_observations", len(rows),
+                                       state.get("session_id", ""),
+                                       state.get("user_id", ""), hospital_id)
+
+            return {**state,
+                    "sql_query_used": "-- adapter.get_broad_abnormal_labs() [fhir] --",
+                    "sql_result": enriched,
+                    "sql_error": "", "sql_retry_count": retry_count,
+                    "data_status": data_status,
+                    "requested_patient_ids": [],
+                    "found_patient_ids": list(distinct_patients),
+                    "missing_patient_ids": []}
+
+        # ── SQL path (LLM-generated SQL with concept-mapped prompt) ────
         condition_hints = _condition_sql_hints(conditions)
 
-        # Base fallback — only used if the LLM-generated query errors or
-        # returns literally nothing. Tagged explicitly as a broadened/
-        # fallback result so the report can say so honestly.
-        base_sql = """
-            SELECT p.subject_id, p.gender, p.anchor_age,
-                   d.label AS lab_name, l.valuenum, l.valueuom,
-                   l.ref_range_lower, l.ref_range_upper, l.flag, l.charttime
-            FROM labevents l
-            JOIN patients p ON l.subject_id = p.subject_id
-            JOIN d_labitems d ON l.itemid = d.itemid
-            WHERE l.valuenum IS NOT NULL
-              AND (
-                  (l.ref_range_upper IS NOT NULL AND l.valuenum > l.ref_range_upper)
-                  OR (l.ref_range_lower IS NOT NULL AND l.valuenum < l.ref_range_lower)
-                  OR l.flag IS NOT NULL
-              )
-              AND l.subject_id IN (
-                  SELECT DISTINCT subject_id FROM labevents
-                  WHERE valuenum IS NOT NULL LIMIT 30
-              )
-            ORDER BY p.subject_id, l.charttime DESC
-            LIMIT 60
-        """
+        # Dynamic SQL instructions built from the adapter's concept map
+        # so the LLM uses the *real* table/column names for this hospital.
+        sql_instructions = adapter.get_sql_prompt_instructions()
 
         broaden_note = ""
         if retry_count > 0:
@@ -821,13 +830,7 @@ VOCABULARY:
 - "abnormal" -> valuenum > ref_range_upper OR valuenum < ref_range_lower OR flag IS NOT NULL
 - "high"/"elevated" -> valuenum > ref_range_upper
 - "low" -> valuenum < ref_range_lower
-- For lab names use LIKE e.g. d.label ILIKE '%creatinine%'
-- ALWAYS include: p.subject_id, p.gender, p.anchor_age, d.label AS lab_name,
-  l.valuenum, l.valueuom, l.ref_range_lower, l.ref_range_upper, l.flag, l.charttime
-- Always JOIN d_labitems d ON l.itemid = d.itemid
-- Always JOIN patients p ON l.subject_id = p.subject_id
-- Use table aliases: labevents l, patients p, d_labitems d
-- WHERE l.valuenum IS NOT NULL always
+{sql_instructions}
 {condition_hints}
 - CRITICAL: When asked for a LIST of patients ("which patients...", "patients with...",
   "how many patients..."), your query MUST return multiple subject_ids. Use IN, GROUP BY,
@@ -835,9 +838,12 @@ VOCABULARY:
   the underlying data supports it. Never write a query that can return only one subject_id
   for a plural question.
 - LIMIT 60 minimum when returning lists.
+- IMPORTANT: Always alias the output columns to the canonical names shown in the SELECT
+  instruction above (subject_id, gender, age, lab_name, valuenum, valueuom,
+  ref_range_lower, ref_range_upper, flag, charttime). Downstream agents rely on
+  these exact names.
 - Return ONLY raw SQL, no markdown, no explanation.{broaden_note}"""
 
-        start = time.monotonic()
         response = self.llm.invoke([
             SystemMessage(content=system_prompt),
             HumanMessage(content=f"Clinical question: {question}")
@@ -849,11 +855,11 @@ VOCABULARY:
         used_fallback = False
 
         if "error" in parsed or len(rows) == 0:
-            logger.info("Generated SQL returned 0 rows or error; using broad fallback query.")
-            result = self.sql_query_tool.invoke({"query": base_sql, "hospital_id": hospital_id})
+            logger.info("Generated SQL returned 0 rows or error; using adapter broad fallback.")
+            result = adapter.get_broad_abnormal_labs(limit=60)
             parsed = json.loads(result)
             rows = parsed.get("rows", [])
-            raw_sql = base_sql
+            raw_sql = "-- adapter.get_broad_abnormal_labs() [sql fallback] --"
             used_fallback = True
 
         duration = int((time.monotonic() - start) * 1000)
@@ -870,7 +876,7 @@ VOCABULARY:
             "used_fallback_broad_query": used_fallback,
         }, default=str)
 
-        self.audit.log_agent_run("sql_extractor", state.get("session_id", ""),
+        self.audit.log_agent_run("data_extractor", state.get("session_id", ""),
                                  duration, True, rows_returned=len(rows),
                                  user_id=state.get("user_id", ""),
                                  hospital_id=hospital_id)
@@ -1583,20 +1589,46 @@ Respond ONLY in JSON:
     def start_new_audit(self) -> dict:
         """
         Returns a brand-new thread config, guaranteed not to reuse any
-        cached state from a previous question. Wire this to a "Start New
-        Audit" button in your UI, e.g. in Streamlit:
-
-            if st.button("Start New Audit"):
-                st.session_state.config = engine.start_new_audit()
-                st.session_state.paused_state = None
-                st.rerun()
-
-        This is preferable to calling new_thread() directly from the UI
-        because it also clears anything the UI might otherwise be tempted
-        to carry over (the UI should discard its own cached paused_state
-        alongside this call, as shown above).
+        cached state from a previous question.
         """
         return self.new_thread()
+
+    def run_triage(self, hospital_id: str, limit: int = 50) -> list[dict]:
+        """
+        Polls the adapter for abnormal labs across the hospital,
+        uses an LLM to evaluate severity and group by patient,
+        and returns a ranked list of the most critical patients.
+        """
+        adapter = self._get_adapter(hospital_id)
+        # 1. Fetch raw abnormal labs
+        raw_json = adapter.get_broad_abnormal_labs(limit=limit)
+        parsed = json.loads(raw_json)
+        rows = parsed.get("rows", [])
+        if not rows:
+            return []
+            
+        # 2. Use LLM to triage
+        prompt = f"""You are a clinical triage AI.
+Review these recent abnormal labs across the hospital:
+{json.dumps(rows)}
+
+Identify up to the 5 most critical patients based on these labs. For each, provide:
+1. "subject_id": The patient ID
+2. "severity_score": 1-10 (10 being most critical)
+3. "reason": A 1-sentence explanation of why they are critical.
+4. "labs": A summary of their key abnormal labs.
+
+Return ONLY a valid JSON array of objects with these exact keys. No markdown."""
+        try:
+            response = self.llm.invoke([SystemMessage(content=prompt)])
+            content = response.content.replace("```json", "").replace("```", "").strip()
+            triage_data = json.loads(content)
+            # Sort by severity descending
+            triage_data.sort(key=lambda x: x.get("severity_score", 0), reverse=True)
+            return triage_data
+        except Exception as e:
+            logger.error(f"Triage failed: {e}")
+            return []
 
 
 # ══════════════════════════════════════════════════════════════════════════

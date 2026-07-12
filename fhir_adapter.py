@@ -477,6 +477,106 @@ would expect from SQL: each result is a list of flat dicts."""
         """
         return json.dumps({"rows": resources, "total_returned": len(resources)}, default=str)
 
+    # ── Canonical-format interface (matches DBAdapter) ────────────────────
+    # Pipeline calls these same methods on any adapter and always gets
+    # {"rows": [{subject_id, gender, age, lab_name, ...}]} back.
+
+    def check_patients_exist(self, patient_ids: list) -> tuple[list, list]:
+        """Check which patient IDs exist via FHIR Patient resource lookups."""
+        found, missing = [], []
+        for pid in patient_ids:
+            patient = self.get_patient(str(pid))
+            (found if patient else missing).append(pid)
+        return found, missing
+
+    @staticmethod
+    def _age_from_birthdate(birth_date: str):
+        """Compute integer age from an ISO birth-date string."""
+        if not birth_date:
+            return ""
+        try:
+            from datetime import date as _date
+            bd = _date.fromisoformat(birth_date)
+            return (_date.today() - bd).days // 365
+        except Exception:
+            return ""
+
+    def get_patient_labs(self, patient_ids: list, limit: int = 200) -> str:
+        """Fetch lab observations for specific patients in canonical format."""
+        all_rows: list[dict] = []
+        per_patient = max(limit // max(len(patient_ids), 1), 10)
+
+        for pid in patient_ids:
+            patient = self.get_patient(str(pid))
+            obs = self.get_observations(str(pid), category="laboratory",
+                                        limit=per_patient)
+            age = self._age_from_birthdate(
+                patient.get("birth_date", "") if patient else ""
+            )
+            for o in obs:
+                all_rows.append({
+                    "subject_id": o["subject_id"],
+                    "gender": patient.get("gender", "") if patient else "",
+                    "age": age,
+                    "lab_name": o.get("lab_name", ""),
+                    "valuenum": o.get("valuenum"),
+                    "valueuom": o.get("valueuom", ""),
+                    "ref_range_lower": o.get("ref_range_lower"),
+                    "ref_range_upper": o.get("ref_range_upper"),
+                    "flag": o.get("flag"),
+                    "charttime": o.get("charttime", ""),
+                })
+
+        return json.dumps(
+            {"rows": all_rows[:limit], "total_returned": len(all_rows)},
+            default=str,
+        )
+
+    def get_broad_abnormal_labs(self, limit: int = 60) -> str:
+        """Fetch abnormal labs across all patients in canonical format."""
+        observations = self.search_abnormal_labs_across_patients()
+        rows: list[dict] = []
+        patient_cache: dict = {}
+
+        for o in observations[:limit]:
+            pid = o.get("subject_id", "")
+            if pid and pid not in patient_cache:
+                try:
+                    patient_cache[pid] = self.get_patient(pid)
+                except Exception:
+                    patient_cache[pid] = None
+
+            patient = patient_cache.get(pid) or {}
+            age = self._age_from_birthdate(patient.get("birth_date", ""))
+            rows.append({
+                "subject_id": pid,
+                "gender": patient.get("gender", ""),
+                "age": age,
+                "lab_name": o.get("lab_name", ""),
+                "valuenum": o.get("valuenum"),
+                "valueuom": o.get("valueuom", ""),
+                "ref_range_lower": o.get("ref_range_lower"),
+                "ref_range_upper": o.get("ref_range_upper"),
+                "flag": o.get("flag"),
+                "charttime": o.get("charttime", ""),
+            })
+
+        return json.dumps(
+            {"rows": rows, "total_returned": len(rows)}, default=str
+        )
+
+    def get_sql_prompt_instructions(self) -> str:
+        """FHIR adapters do not use SQL — returns empty string."""
+        return ""
+
+    def run_query(self, sql: str) -> str:
+        """FHIR adapters do not support raw SQL.  Returns a helpful error
+        so the pipeline can detect and handle this gracefully."""
+        return json.dumps({
+            "error": "This data source uses FHIR (not SQL). "
+                     "Use the adapter's Python methods instead.",
+            "hint": "FHIR endpoints do not support SQL queries.",
+        })
 
 # ══════════════════════════════════════════════════════════════════════════
 # LOINC CODE LOOKUP — common clinical lab codes
