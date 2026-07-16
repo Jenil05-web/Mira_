@@ -19,7 +19,7 @@ ISOLATED FROM mira_pipeline.py — does not run unless you explicitly wire
 it into Agent 1's output or call it directly.
 
 HOW TO WIRE IT IN (your decision, not automatic):
-    from trend_agent import TrendAgent
+    from pipeline.agents.trend import TrendAgent
     trend_agent = TrendAgent(conn)  # same sqlite3 connection as your engine
     trend_result = trend_agent.analyze_patient_lab(subject_id=10027602, lab_name="creatinine")
     # then pass trend_result["summary"] into Agent 3's prompt as a third

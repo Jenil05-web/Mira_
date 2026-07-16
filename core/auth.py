@@ -332,7 +332,7 @@ def require_auth(auth_manager: "AuthManager") -> "User":
     If authenticated, returns the User object.
 
     Usage:
-        from auth import require_auth, AuthManager
+        from core.auth import require_auth, AuthManager
         auth = AuthManager(jwt_secret=cfg.get("MIRA_JWT_SECRET"))
         user = require_auth(auth)
     """
