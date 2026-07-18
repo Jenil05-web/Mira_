@@ -238,6 +238,36 @@ CONDITION_VOCAB: dict[str, dict] = {
         "sql_hint": "For leukocytosis: d.label ILIKE '%white blood cell%' AND l.valuenum > l.ref_range_upper.",
         "search_terms": "leukocytosis elevated white blood cell count causes",
     },
+    "nausea": {
+        "aliases": ["nausea", "nauseous", "feeling sick"],
+        "sql_hint": "For nausea: typically a clinical symptom, check for any associated electrolyte imbalances like sodium or potassium or signs of dehydration.",
+        "search_terms": "nausea differential diagnosis clinical evaluation",
+    },
+    "vomiting": {
+        "aliases": ["vomiting", "emesis", "throwing up", "puking"],
+        "sql_hint": "For vomiting: check for hypokalemia (d.label ILIKE '%potassium%') and metabolic alkalosis (d.label ILIKE '%bicarbonate%').",
+        "search_terms": "vomiting emesis hypokalemia dehydration management",
+    },
+    "headache": {
+        "aliases": ["headache", "migraine", "head pain"],
+        "sql_hint": "For headache: check for any abnormal vital signs, particularly elevated blood pressure.",
+        "search_terms": "headache migraine tension secondary causes evaluation",
+    },
+    "dizziness": {
+        "aliases": ["dizziness", "dizzy", "lightheaded", "vertigo"],
+        "sql_hint": "For dizziness: check for anemia (low hemoglobin/hematocrit) or hypoglycemia (low glucose).",
+        "search_terms": "dizziness vertigo lightheadedness orthostatic evaluation",
+    },
+    "red eyes": {
+        "aliases": ["red eyes", "red eye", "bloodshot eyes", "conjunctivitis"],
+        "sql_hint": "For red eyes: mostly a clinical finding, check for systemic signs of inflammation (WBC, CRP).",
+        "search_terms": "red eye conjunctivitis differential diagnosis management",
+    },
+    "fever": {
+        "aliases": ["fever", "feverish", "high temperature", "pyrexia"],
+        "sql_hint": "For fever: check for signs of infection such as elevated WBC (d.label ILIKE '%white blood cell%') or lactate.",
+        "search_terms": "fever pyrexia infection evaluation causes",
+    },
 }
 
 LIST_INTENT_PHRASES = [
@@ -404,5 +434,3 @@ class VectorStore:
             chunk["relevance_score"] = round(1 / (1 + float(dist)), 4)
             results.append(chunk)
         return results
-
-

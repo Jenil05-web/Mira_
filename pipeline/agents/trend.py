@@ -11,54 +11,114 @@ WHY THIS EXISTS:
 
   This agent pulls a patient's full history for a given lab and detects
   directional trends, rate of change, and whether a value crossed a
-  critical threshold during the trend — independent of any ML framework.
-  Pure pandas/numpy — no GPU, no extra heavy dependency, fits tabular
-  labevents data exactly as it exists in MIMIC-IV.
+  reference bound during the trend.
 
-ISOLATED FROM mira_pipeline.py — does not run unless you explicitly wire
-it into Agent 1's output or call it directly.
-
-HOW TO WIRE IT IN (your decision, not automatic):
-    from pipeline.agents.trend import TrendAgent
-    trend_agent = TrendAgent(conn)  # same sqlite3 connection as your engine
-    trend_result = trend_agent.analyze_patient_lab(subject_id=10027602, lab_name="creatinine")
-    # then pass trend_result["summary"] into Agent 3's prompt as a third
-    # data source, alongside sql_result and guideline_text
+SCHEMA-AGNOSTIC:
+  TrendAgent now accepts a DBAdapter instance and derives all table/column
+  names from its concept map, so it works against any hospital's schema —
+  not just MIMIC-IV's labevents/d_labitems layout.
 """
 
 import json
-import sqlite3
 from typing import Optional
 
 import numpy as np
 import pandas as pd
+from sqlalchemy import text
 
 
 class TrendAgent:
     """
-    Detects directional trends in a patient's repeated lab measurements
-    over time. Pure statistical — no ML model required.
+    Detects directional trends in a patient's repeated lab measurements.
+    Fully schema-agnostic: uses the DBAdapter concept map for all names.
     """
 
-    def __init__(self, conn: sqlite3.Connection):
-        self.conn = conn
+    def __init__(self, adapter):
+        """
+        Args:
+            adapter: a DBAdapter instance (has .engine and ._table_map).
+        """
+        self.adapter = adapter
+        # Ensure schema is discovered
+        if not adapter._table_map:
+            adapter.discover_schema()
+        self._map = adapter._table_map
+
+    # ── Internal helpers ────────────────────────────────────────────────────
+
+    def _schema_names(self):
+        """Return (lab_table, lab_cols, dict_table, dict_cols, pat_pid_col)."""
+        lab  = self._map.get("labevents", {})
+        dct  = self._map.get("lab_dict", {})
+        pat  = self._map.get("patients", {})
+
+        lt   = lab.get("table", "labevents")
+        lc   = lab.get("columns", {})
+        dt   = dct.get("table", "d_labitems") if dct else None
+        dc   = dct.get("columns", {}) if dct else {}
+        pc   = pat.get("columns", {}) if pat else {}
+
+        return lt, lc, dt, dc, pc
+
+    def _read_df(self, sql: str, params: dict) -> pd.DataFrame:
+        """Execute a SQL query via the adapter's SQLAlchemy engine."""
+        with self.adapter.engine.connect() as conn:
+            return pd.read_sql_query(text(sql), conn, params=params)
+
+    # ── Public API ──────────────────────────────────────────────────────────
 
     def analyze_patient_lab(self, subject_id: int, lab_name: str) -> dict:
         """
         Pulls all historical readings for a given lab + patient, computes
         trend direction, slope, and whether it crossed reference bounds.
         """
-        query = """
-            SELECT l.charttime, l.valuenum, l.valueuom,
-                   l.ref_range_lower, l.ref_range_upper, d.label
-            FROM labevents l
-            JOIN d_labitems d ON l.itemid = d.itemid
-            WHERE l.subject_id = ?
-              AND d.label LIKE ?
-              AND l.valuenum IS NOT NULL
-            ORDER BY l.charttime ASC
+        lt, lc, dt, dc, pc = self._schema_names()
+
+        l_pid   = lc.get("patient_id",    "subject_id")
+        l_val   = lc.get("lab_valuenum",  "valuenum")
+        l_uom   = lc.get("lab_unit",      "valueuom")
+        l_rlo   = lc.get("ref_lower",     "ref_range_lower")
+        l_rhi   = lc.get("ref_upper",     "ref_range_upper")
+        l_time  = lc.get("chart_time",    "charttime")
+        l_item  = lc.get("lab_item_id",   "itemid")
+
+        if dt:
+            d_item  = dc.get("lab_item_id", list(dc.values())[0] if dc else "itemid")
+            d_label = dc.get("lab_name",  "label")
+            join_clause = f"JOIN {dt} d ON l.{l_item} = d.{d_item}"
+            name_col    = f"d.{d_label}"
+            name_filter = f"AND {name_col} ILIKE :lab_pattern"
+        else:
+            join_clause = ""
+            name_col    = "NULL"
+            name_filter = ""
+
+        sql = f"""
+            SELECT l.{l_time}    AS charttime,
+                   l.{l_val}     AS valuenum,
+                   l.{l_uom}     AS valueuom,
+                   l.{l_rlo}     AS ref_range_lower,
+                   l.{l_rhi}     AS ref_range_upper,
+                   {name_col}    AS label
+            FROM {lt} l
+            {join_clause}
+            WHERE l.{l_pid} = :subject_id
+              {name_filter}
+              AND l.{l_val} IS NOT NULL
+            ORDER BY l.{l_time} ASC
         """
-        df = pd.read_sql_query(query, self.conn, params=(subject_id, f"%{lab_name}%"))
+        params = {"subject_id": subject_id, "lab_pattern": f"%{lab_name}%"}
+
+        try:
+            df = self._read_df(sql, params)
+        except Exception as e:
+            return {
+                "source": "trend_agent",
+                "subject_id": subject_id,
+                "lab_name": lab_name,
+                "trend": "insufficient_data",
+                "summary": f"Query error: {e}",
+            }
 
         if df.empty:
             return {
@@ -66,7 +126,7 @@ class TrendAgent:
                 "subject_id": subject_id,
                 "lab_name": lab_name,
                 "trend": "insufficient_data",
-                "summary": f"No historical readings found for {lab_name} for this patient."
+                "summary": f"No historical readings found for {lab_name} for patient {subject_id}.",
             }
 
         if len(df) < 2:
@@ -80,15 +140,16 @@ class TrendAgent:
                 "summary": (
                     f"Only one {lab_name} reading on record "
                     f"({single['valuenum']} {single.get('valueuom', '')}). "
-                    f"Cannot establish a trend from a single data point."
-                )
+                    "Cannot establish a trend from a single data point."
+                ),
             }
 
         return self._compute_trend(df, lab_name, subject_id)
 
-    def _compute_trend(self, df: pd.DataFrame, lab_name: str, subject_id: Optional[int] = None) -> dict:
+    def _compute_trend(self, df: pd.DataFrame, lab_name: str,
+                       subject_id: Optional[int] = None) -> dict:
         values = df["valuenum"].values
-        times = pd.to_datetime(df["charttime"])
+        times  = pd.to_datetime(df["charttime"])
 
         hours_elapsed = (times - times.iloc[0]).dt.total_seconds() / 3600
         slope = np.polyfit(hours_elapsed, values, 1)[0] if len(values) >= 2 else 0
@@ -99,8 +160,8 @@ class TrendAgent:
         ref_upper = df["ref_range_upper"].dropna().iloc[-1] if df["ref_range_upper"].notna().any() else None
         ref_lower = df["ref_range_lower"].dropna().iloc[-1] if df["ref_range_lower"].notna().any() else None
 
-        crossed_critical_high = ref_upper is not None and last_val > ref_upper and first_val <= ref_upper
-        crossed_critical_low  = ref_lower is not None and last_val < ref_lower and first_val >= ref_lower
+        crossed_critical_high = ref_upper is not None and last_val > ref_upper  and first_val <= ref_upper
+        crossed_critical_low  = ref_lower is not None and last_val < ref_lower  and first_val >= ref_lower
 
         if abs(pct_change) < 5:
             trend = "stable"
@@ -135,36 +196,70 @@ class TrendAgent:
             "pct_change": round(float(pct_change), 2),
             "crossed_critical_high": bool(crossed_critical_high),
             "crossed_critical_low": bool(crossed_critical_low),
-            "summary": " ".join(summary_parts)
+            "summary": " ".join(summary_parts),
         }
 
     def analyze_as_tool_output(self, subject_id: int, lab_name: str) -> str:
         """JSON string version — drop-in alongside sql_query/vector_search outputs."""
         return json.dumps(self.analyze_patient_lab(subject_id, lab_name), default=str)
 
-    def find_worsening_patients(self, lab_name: str, min_readings: int = 2, limit: int = 10) -> dict:
+    def find_worsening_patients(self, lab_name: str, min_readings: int = 2,
+                                limit: int = 10) -> dict:
         """
         Scans all patients with repeated readings of a given lab and returns
-        those showing a worsening trajectory — useful for "who is getting
-        worse" style triage questions rather than single-patient lookup.
+        those showing a worsening trajectory.
         """
-        query = """
-            SELECT l.subject_id, l.charttime, l.valuenum, l.valueuom,
-                   l.ref_range_lower, l.ref_range_upper, d.label
-            FROM labevents l
-            JOIN d_labitems d ON l.itemid = d.itemid
-            WHERE d.label LIKE ? AND l.valuenum IS NOT NULL
-            ORDER BY l.subject_id, l.charttime ASC
+        lt, lc, dt, dc, _ = self._schema_names()
+
+        l_pid   = lc.get("patient_id",   "subject_id")
+        l_val   = lc.get("lab_valuenum", "valuenum")
+        l_uom   = lc.get("lab_unit",     "valueuom")
+        l_rlo   = lc.get("ref_lower",    "ref_range_lower")
+        l_rhi   = lc.get("ref_upper",    "ref_range_upper")
+        l_time  = lc.get("chart_time",   "charttime")
+        l_item  = lc.get("lab_item_id",  "itemid")
+
+        if dt:
+            d_item  = dc.get("lab_item_id", list(dc.values())[0] if dc else "itemid")
+            d_label = dc.get("lab_name",  "label")
+            join_clause = f"JOIN {dt} d ON l.{l_item} = d.{d_item}"
+            name_col    = f"d.{d_label}"
+            name_filter = f"AND {name_col} ILIKE :lab_pattern"
+        else:
+            join_clause = ""
+            name_col    = "NULL"
+            name_filter = ""
+
+        sql = f"""
+            SELECT l.{l_pid}  AS subject_id,
+                   l.{l_time} AS charttime,
+                   l.{l_val}  AS valuenum,
+                   l.{l_uom}  AS valueuom,
+                   l.{l_rlo}  AS ref_range_lower,
+                   l.{l_rhi}  AS ref_range_upper,
+                   {name_col} AS label
+            FROM {lt} l
+            {join_clause}
+            WHERE l.{l_val} IS NOT NULL
+              {name_filter}
+            ORDER BY l.{l_pid}, l.{l_time} ASC
         """
-        df = pd.read_sql_query(query, self.conn, params=(f"%{lab_name}%",))
+        params = {"lab_pattern": f"%{lab_name}%"}
+
+        try:
+            df = self._read_df(sql, params)
+        except Exception as e:
+            return {"source": "trend_agent", "lab_name": lab_name,
+                    "worsening_patients": [], "error": str(e)}
+
         if df.empty:
             return {"source": "trend_agent", "lab_name": lab_name, "worsening_patients": []}
 
         results = []
-        for subject_id, group in df.groupby("subject_id"):
+        for pid, group in df.groupby("subject_id"):
             if len(group) < min_readings:
                 continue
-            trend_result = self._compute_trend(group.reset_index(drop=True), lab_name, int(subject_id))
+            trend_result = self._compute_trend(group.reset_index(drop=True), lab_name, int(pid))
             if trend_result["trend"] == "worsening":
                 results.append(trend_result)
 
@@ -173,23 +268,5 @@ class TrendAgent:
             "source": "trend_agent",
             "lab_name": lab_name,
             "worsening_patients": results[:limit],
-            "total_worsening_found": len(results)
+            "total_worsening_found": len(results),
         }
-
-
-if __name__ == "__main__":
-    import sys
-    from pathlib import Path
-
-    db_path = Path("./mira_data/mimic.db")
-    if not db_path.exists():
-        print(f"DB not found at {db_path}. Run 01_data_setup.ipynb first.")
-        sys.exit(1)
-
-    conn = sqlite3.connect(db_path)
-    agent = TrendAgent(conn)
-
-    lab = sys.argv[1] if len(sys.argv) > 1 else "creatinine"
-    print(f"Scanning for worsening '{lab}' trends across all patients...\n")
-    result = agent.find_worsening_patients(lab)
-    print(json.dumps(result, indent=2, default=str)[:3000])

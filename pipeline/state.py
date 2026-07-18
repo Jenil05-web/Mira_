@@ -226,5 +226,3 @@ def make_initial_state(clinical_question: str,
         "spoken_language": spoken_language,
         "original_transcript": original_transcript,
     }
-
-

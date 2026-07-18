@@ -131,7 +131,6 @@ import logging
 import os
 import pickle
 import re
-import sqlite3
 import time
 import uuid
 from pathlib import Path
@@ -306,11 +305,7 @@ class MIRAEngineProd:
             adapter = self._get_adapter(hospital_id)
             if isinstance(adapter, DBAdapter):
                 try:
-                    raw_conn = sqlite3.connect(
-                        adapter.connection_string.replace("sqlite:///", ""),
-                        check_same_thread=False
-                    ) if "sqlite" in adapter.connection_string else adapter.engine.raw_connection()
-                    self._trend_agents[hospital_id] = TrendAgent(raw_conn)
+                    self._trend_agents[hospital_id] = TrendAgent(adapter)
                 except Exception:
                     return None
             else:

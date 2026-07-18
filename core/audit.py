@@ -86,8 +86,17 @@ class AuditLogger:
                 self.enabled = False
                 logger.warning("AuditLogger disabled because no connection string was provided.")
                 return
-            self.engine = create_engine(connection_string)
+            self.engine = self._make_engine()
             self._ensure_table()
+
+    def _make_engine(self):
+        """Create engine with pool_pre_ping so stale Supabase connections
+        are detected and recycled before they raise OperationalError."""
+        return create_engine(
+            self.connection_string,
+            pool_pre_ping=True,
+            pool_recycle=300,
+        )
 
     # ── Table setup ──────────────────────────────────────────────────────
     def _ensure_table(self):
@@ -144,7 +153,7 @@ class AuditLogger:
             "metadata": json.dumps(kwargs.get("metadata", {}), default=str),
         }
 
-        try:
+        def _do_write():
             with self.engine.connect() as conn:
                 conn.execute(
                     text(
@@ -162,9 +171,17 @@ class AuditLogger:
                     record,
                 )
                 conn.commit()
+
+        try:
+            _do_write()
+        except OperationalError:
+            # Stale connection — rebuild engine and retry once
+            try:
+                self.engine = self._make_engine()
+                _do_write()
+            except Exception as e:
+                logger.error(f"AuditLogger write failed after reconnect: {e}")
         except Exception as e:
-            # Audit log failure should never crash the application.
-            # Log to standard logger as fallback.
             logger.error(f"AuditLogger write failed: {e} | Record: {record}")
 
     # ── Structured log methods ───────────────────────────────────────────

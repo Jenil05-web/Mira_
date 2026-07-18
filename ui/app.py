@@ -84,6 +84,7 @@ from core.auth import AuthManager, require_auth, Role
 from core.config import ConfigManager
 from core.audit import AuditLogger
 from pipeline.engine import get_engine
+from pipeline.ambient import AmbientConsultEngine
 
 # ══════════════════════════════════════════════════════════════════════════
 # PAGE CONFIG
@@ -174,20 +175,17 @@ def init_session():
         "paused_state": None,
         "final_state": None,
         "show_feedback_box": False,
-        "active_tab": "audit",   # "audit" | "admin"
+        "active_tab": "audit",
         "pending_question": "",
-        # FIX: separate, durable field — pending_question gets cleared once
-        # the run kicks off, but submit_human_decision needs the original
-        # question throughout the entire audit (approve, reject, revise).
         "current_question": "",
-        # NEW — voice input (auto-detected language, no manual selector)
-        "voice_original_transcript": "",       # verbatim transcript, kept for audit trail
-        "voice_spoken_language": "",            # language auto-detected server-side
-        "current_input_mode": "text",           # "text" | "voice" — for the current/last audit
-        # FIX: staging key used to push transcribed text into the
-        # question_input widget *before* it is instantiated, since
-        # Streamlit forbids writing to a widget's key after creation.
+        "voice_original_transcript": "",
+        "voice_spoken_language": "",
+        "current_input_mode": "text",
         "_pending_question_text": None,
+        # Ambient Consult Mode
+        "ambient_state": None,
+        "ambient_stage": "idle",    # idle | processing | review | done
+        "ambient_audio_bytes": None,
     }
     for key, val in defaults.items():
         if key not in st.session_state:
@@ -301,9 +299,11 @@ st.markdown(f"""
 # ══════════════════════════════════════════════════════════════════════════
 
 if user.can("view_audit_log"):
-    tab_audit, tab_triage, tab_admin = st.tabs(["Clinical Audit", "Live Triage Dashboard", "Admin"])
+    tab_audit, tab_triage, tab_ambient, tab_admin = st.tabs(
+        ["Clinical Audit", "Live Triage Dashboard", "Ambient Consult", "Admin"])
 else:
-    tab_audit, tab_triage = st.tabs(["Clinical Audit", "Live Triage Dashboard"])
+    tab_audit, tab_triage, tab_ambient = st.tabs(
+        ["Clinical Audit", "Live Triage Dashboard", "Ambient Consult"])
     tab_admin = None
 
 
@@ -744,7 +744,272 @@ if tab_triage:
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# TAB 2 — ADMIN PANEL (admin role only)
+# TAB — AMBIENT CONSULT MODE
+# ══════════════════════════════════════════════════════════════════════════
+
+@st.cache_resource
+def _get_ambient_engine():
+    return AmbientConsultEngine(engine)
+
+ambient_engine = _get_ambient_engine()
+
+with tab_ambient:
+    st.markdown('<div style="height:12px;"></div>', unsafe_allow_html=True)
+
+    # ── Header ───────────────────────────────────────────────────────────
+    st.markdown("""
+    <div style="margin-bottom: 4px;">
+        <div style="font-family:'Newsreader',serif; font-size:24px; font-weight:500; color:#1C2B33;">Ambient Consult Mode</div>
+        <div style="font-size:13.5px; color:#5C7A89; margin-top:4px;">
+            MIRA listens to the consultation and auto-drafts a structured SOAP note — no typing required.
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    amb_stage = st.session_state.get("ambient_stage", "idle")
+
+    # ── STAGE: IDLE ──────────────────────────────────────────────────
+    if amb_stage == "idle":
+        st.markdown("""
+        <div style="background:#F0F7FF; border:1px solid #C5D9E8; border-radius:10px; padding:18px 20px; margin:18px 0;">
+            <div style="font-size:13.5px; font-weight:600; color:#1C2B33; margin-bottom:6px;">Before you begin</div>
+            <div style="font-size:13px; color:#5C7A89; line-height:1.7;">
+                This mode auto-transcribes the consultation and drafts a SOAP note.
+                The patient must verbally consent before recording starts.
+                Audio is processed immediately and not stored after the note is generated.
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+
+        amb_left, amb_right = st.columns([2, 1])
+        with amb_left:
+            patient_id_input = st.text_input(
+                "Patient MRN / ID (optional)",
+                placeholder="Leave blank for walk-in patients with no record",
+                key="amb_patient_id"
+            )
+            consent_cb = st.checkbox(
+                "I confirm the patient has verbally consented to AI-assisted note-taking.",
+                key="amb_consent"
+            )
+        with amb_right:
+            st.markdown('<div style="height:52px;"></div>', unsafe_allow_html=True)
+            if st.button("🎤  Start Consult", type="primary",
+                         disabled=not consent_cb, use_container_width=True):
+                new_state = ambient_engine.new_session(
+                    user_id=user.user_id,
+                    hospital_id=user.hospital_id,
+                    patient_id=patient_id_input.strip() or None
+                )
+                st.session_state.ambient_state = new_state
+                st.session_state.ambient_stage  = "recording"
+                # Reset all working state
+                st.session_state._amb_live_transcript_readonly = ""
+                st.session_state._amb_mic_key   = 0
+                st.session_state._amb_last_size = 0
+                st.rerun()
+
+    # ── STAGE: RECORDING ─────────────────────────────────────────────
+    elif amb_stage == "recording":
+        amb_s   = st.session_state.ambient_state
+        mic_key = st.session_state.get("_amb_mic_key", 0)
+        start_ts = int(amb_s.started_at or time.time())
+
+        # ── Status bar with live JS timer ────────────────────────────
+        st.markdown(f"""
+        <div style="background:#FFF5F5; border:1px solid #F5C6C6; border-radius:10px;
+             padding:14px 20px; margin:8px 0; display:flex; align-items:center; gap:14px;">
+            <span style="width:10px;height:10px;border-radius:50%;background:#C9501F;
+                  display:inline-block;animation:blink 1s step-start infinite;"></span>
+            <div style="flex:1;">
+                <span style="font-weight:600;color:#C9501F;font-size:14.5px;">
+                    Consult live &nbsp;&middot;&nbsp; <span id="amb-timer">00:00</span>
+                </span>
+                <span style="font-size:12px;color:#8FA3AE;margin-left:16px;">
+                    Speak → stop → transcript auto-appears. Repeat as needed.
+                </span>
+            </div>
+        </div>
+        <style>@keyframes blink{{50%{{opacity:0}}}}</style>
+        <script>(function(){{
+            var s={start_ts};
+            function f(n){{return String(n).padStart(2,'0')}}
+            function t(){{
+                var e=Math.floor(Date.now()/1000)-s,m=Math.floor(e/60),sc=e%60;
+                var el=document.getElementById('amb-timer');
+                if(el)el.innerText=f(m)+':'+f(sc);
+            }}
+            t();setInterval(t,1000);
+        }})();</script>
+        """, unsafe_allow_html=True)
+
+        # ── True Live Transcript Component (Web Speech API) ─────────────
+        st.markdown(
+            '<div style="font-size:14px;font-weight:600;color:#1C2B33;margin:12px 0 6px 0;">'
+            '🎤 Live Transcription &nbsp;<span style="font-weight:400;color:#8FA3AE;">'
+            '— Speak naturally. Words appear instantly. Zero API cost.</span></div>',
+            unsafe_allow_html=True
+        )
+
+        from ui.ambient_speech import live_speech_component
+        
+        # The component renders the UI box and returns the transcript string
+        live_txt = live_speech_component(key=f"amb_speech_comp_{mic_key}")
+        
+        # Always save the latest transcript to session state for "End Consult"
+        if live_txt:
+            st.session_state._amb_live_transcript_readonly = live_txt
+
+        # ── Footer buttons ────────────────────────────────────────────
+        st.markdown('<div style="height:8px;"></div>', unsafe_allow_html=True)
+        col_end, col_spacer, col_cancel = st.columns([2, 3, 1])
+        with col_end:
+            if st.button("⏹  End Consult & Generate SOAP Note", type="primary", use_container_width=True):
+                final_transcript = st.session_state.get("_amb_live_transcript_readonly", "").strip()
+                st.session_state._amb_final_transcript = final_transcript
+                st.session_state._amb_mic_key   = 0
+                st.session_state._amb_last_size = 0
+                st.session_state.ambient_stage  = "processing"
+                st.rerun()
+        with col_cancel:
+            if st.button("Cancel", use_container_width=True):
+                st.session_state.ambient_state  = None
+                st.session_state.ambient_stage  = "idle"
+                st.session_state._amb_live_transcript_readonly = ""
+                st.session_state._amb_mic_key   = 0
+                st.session_state._amb_last_size = 0
+                st.rerun()
+
+    # ── STAGE: PROCESSING ────────────────────────────────────────────
+    elif amb_stage == "processing":
+        amb_s = st.session_state.ambient_state
+        final_transcript = st.session_state.get("_amb_final_transcript", "").strip()
+
+        if not final_transcript:
+            st.warning("No transcript was recorded. Please speak at least one segment before ending the consult.")
+            st.session_state.ambient_stage = "recording"
+            st.rerun()
+
+        with st.spinner("🧠  Analysing consultation and drafting SOAP note..."):
+            amb_s = ambient_engine.process_consult(
+                amb_s,
+                audio_bytes=None,
+                transcript_text=final_transcript
+            )
+            st.session_state.ambient_state = amb_s
+            st.session_state.ambient_stage  = "review"
+            st.session_state._amb_live_transcript_readonly = ""
+            st.session_state._amb_final_transcript    = ""
+        st.rerun()
+
+
+
+
+    # ── STAGE: REVIEW ────────────────────────────────────────────────
+    elif amb_stage == "review":
+        amb_s = st.session_state.ambient_state
+
+        # Safety flags banner
+        flags = amb_s.safety_flags
+        if flags and "hallucination_detected" in flags:
+            st.markdown(f'<div class="banner banner-flagged"><span>▲</span>Safety review flagged potential issues: {"; ".join(flags)}</div>',
+                        unsafe_allow_html=True)
+        else:
+            st.markdown('<div class="banner banner-approved"><span>✓</span>Safety check passed — note reflects consultation content</div>',
+                        unsafe_allow_html=True)
+
+        # Extracted entities summary (collapsible)
+        entities = amb_s.structured_entities
+        if entities:
+            with st.expander("View extracted clinical entities", expanded=False):
+                ent_cols = st.columns(3)
+                fields = [
+                    ("Chief Complaint", entities.get("chief_complaint", "—")),
+                    ("Symptoms", ", ".join(entities.get("symptoms", [])) or "—"),
+                    ("Duration", entities.get("symptom_duration", "—")),
+                    ("Medications", ", ".join(entities.get("current_medications", [])) or "—"),
+                    ("Allergies", ", ".join(entities.get("allergies", [])) or "—"),
+                    ("History", ", ".join(entities.get("patient_history", [])) or "—"),
+                ]
+                for i, (label, val) in enumerate(fields):
+                    with ent_cols[i % 3]:
+                        st.markdown(f'<div class="panel-eyebrow">{label}</div>', unsafe_allow_html=True)
+                        st.markdown(f'<div style="font-size:13px;color:#1C2B33;margin-bottom:12px;">{val}</div>', unsafe_allow_html=True)
+
+        # Draft note (editable)
+        st.markdown('<div class="panel-eyebrow with-dot"><span class="eyebrow-dot"></span>DRAFT SOAP NOTE — Review and edit before filing</div>',
+                    unsafe_allow_html=True)
+        edited_note = st.text_area(
+            "Draft SOAP Note",
+            value=amb_s.draft_note,
+            height=480,
+            label_visibility="collapsed",
+            key="amb_edited_note"
+        )
+
+        # Action buttons
+        btn_approve, btn_restart, _ = st.columns([1, 1, 2])
+        with btn_approve:
+            if st.button("✓  Approve & Export Note", type="primary", use_container_width=True):
+                amb_s = ambient_engine.approve(amb_s, doctor_edits=edited_note)
+                st.session_state.ambient_state = amb_s
+                st.session_state.ambient_stage  = "done"
+                st.rerun()
+        with btn_restart:
+            if st.button("New Consult", use_container_width=True):
+                st.session_state.ambient_state = None
+                st.session_state.ambient_stage  = "idle"
+                st.session_state.ambient_audio_bytes = None
+                st.rerun()
+
+    # ── STAGE: DONE ──────────────────────────────────────────────────
+    elif amb_stage == "done":
+        amb_s = st.session_state.ambient_state
+        st.markdown('<div class="banner banner-approved"><span>✓</span>SOAP note approved and ready to file</div>',
+                    unsafe_allow_html=True)
+        st.markdown('<div class="panel-eyebrow with-dot"><span class="eyebrow-dot"></span>FINAL SOAP NOTE</div>',
+                    unsafe_allow_html=True)
+        render_report_panel(amb_s.final_note)
+
+        # Export
+        html_note = f"""<html><head><meta charset="utf-8"></head>
+        <body><h2>MIRA SOAP Note</h2>
+        {md_lib.markdown(amb_s.final_note)}
+        <br><p><small>Patient: {amb_s.patient_id or 'Walk-in'} &nbsp;|&nbsp; Doctor: {user.display_name} &nbsp;|&nbsp; {time.strftime('%Y-%m-%d %H:%M')}</small></p>
+        </body></html>"""
+
+        st.markdown("""
+        <style>
+        div[data-testid="stDownloadButton"] button {
+            background-color: #5C7A89 !important; color: #FFFFFF !important;
+            border: none !important; transition: none !important;
+        }
+        div[data-testid="stDownloadButton"] button:hover {
+            background-color: #5C7A89 !important;
+        }
+        </style>
+        """, unsafe_allow_html=True)
+
+        exp1, exp2, exp3, _ = st.columns([1.2, 1.2, 1.2, 1.5])
+        with exp1:
+            st.download_button("Export as Word (.doc)", data=html_note,
+                               file_name=f"SOAP_Note_{int(time.time())}.doc",
+                               mime="application/msword")
+        with exp2:
+            plain_text = amb_s.final_note.encode("utf-8")
+            st.download_button("Export as Text (.txt)", data=plain_text,
+                               file_name=f"SOAP_Note_{int(time.time())}.txt",
+                               mime="text/plain")
+        with exp3:
+            if st.button("Start New Consult", use_container_width=True):
+                st.session_state.ambient_state = None
+                st.session_state.ambient_stage  = "idle"
+                st.session_state.ambient_audio_bytes = None
+                st.rerun()
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# TAB — ADMIN PANEL (admin role only)
 # ══════════════════════════════════════════════════════════════════════════
 
 if tab_admin and user.can("view_audit_log"):

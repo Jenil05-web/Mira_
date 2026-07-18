@@ -1,0 +1,127 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Live Ambient Speech</title>
+  <!-- Minimal Streamlit Component script -->
+  <script src="https://cdn.jsdelivr.net/npm/streamlit-component-lib@1.3.0/dist/streamlit.js"></script>
+  <style>
+    body {
+      font-family: "Source Sans Pro", sans-serif;
+      margin: 0; padding: 0;
+      color: #1C2B33;
+    }
+    .container {
+      background: #fff;
+      border: 1px solid #C5D9E8;
+      border-radius: 6px;
+      padding: 16px;
+      height: 240px;
+      overflow-y: auto;
+      font-size: 14px;
+      line-height: 1.5;
+      box-sizing: border-box;
+      position: relative;
+    }
+    .placeholder { color: #8FA3AE; }
+    .status {
+      position: absolute;
+      bottom: 12px;
+      right: 12px;
+      font-size: 11px;
+      color: #C9501F;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      font-weight: 600;
+    }
+    .dot {
+      width: 8px; height: 8px;
+      background: #C9501F;
+      border-radius: 50%;
+      animation: blink 1s infinite;
+    }
+    @keyframes blink { 50% { opacity: 0; } }
+  </style>
+</head>
+<body>
+
+  <div class="container" id="transcript-box">
+    <div id="text"><span class="placeholder">Listening... Words will appear here automatically.</span></div>
+    <div class="status"><div class="dot"></div> Live</div>
+  </div>
+
+  <script>
+    // Component lifecycle
+    function onRender(event) {
+      Streamlit.setFrameHeight(240);
+    }
+    Streamlit.events.addEventListener(Streamlit.RENDER_EVENT, onRender);
+    Streamlit.setComponentReady();
+    Streamlit.setFrameHeight(240);
+
+    // Web Speech API
+    const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+    let finalTranscript = "";
+    let isRunning = false;
+    const textDiv = document.getElementById("text");
+
+    if (SpeechRecognition) {
+      const recognition = new SpeechRecognition();
+      recognition.continuous = true;
+      recognition.interimResults = true;
+      recognition.lang = 'en-US';
+
+      recognition.onresult = (event) => {
+        let interimTranscript = "";
+        for (let i = event.resultIndex; i < event.results.length; ++i) {
+          if (event.results[i].isFinal) {
+            finalTranscript += event.results[i][0].transcript + " ";
+          } else {
+            interimTranscript += event.results[i][0].transcript;
+          }
+        }
+        
+        let displayHtml = "";
+        if (finalTranscript) {
+          displayHtml += "<span>" + finalTranscript + "</span>";
+        }
+        if (interimTranscript) {
+          displayHtml += "<i style='color: #8FA3AE'>" + interimTranscript + "</i>";
+        }
+        
+        textDiv.innerHTML = displayHtml || "<span class='placeholder'>Listening... Words will appear here automatically.</span>";
+        
+        // Auto scroll
+        document.getElementById("transcript-box").scrollTop = document.getElementById("transcript-box").scrollHeight;
+
+        // Send value to Streamlit
+        Streamlit.setComponentValue(finalTranscript + interimTranscript);
+      };
+
+      recognition.onend = () => {
+        // Automatically restart if it stops unexpectedly (e.g. pause in speaking)
+        if (isRunning) {
+            try { recognition.start(); } catch(e){}
+        }
+      };
+
+      recognition.onerror = (event) => {
+        console.error("Speech error", event.error);
+        if (event.error === 'not-allowed') {
+           textDiv.innerHTML = "<span style='color:red'>Microphone access denied. Please allow mic in browser settings.</span>";
+        }
+      };
+
+      // Start immediately when the component loads
+      try {
+        recognition.start();
+        isRunning = true;
+      } catch(e) {}
+
+    } else {
+      textDiv.innerHTML = "<span style='color:red'>Your browser does not support live speech recognition. Please use Google Chrome or Edge.</span>";
+    }
+  </script>
+</body>
+</html>
