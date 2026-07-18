@@ -191,11 +191,54 @@ class DBAdapter:
         return mapped
 
     # ── Query execution ──────────────────────────────────────────────────
+    # ── SQL Safety Gate ──────────────────────────────────────────────────
+    _BLOCKED_KEYWORDS = re.compile(
+        r"\b(DROP|DELETE|UPDATE|INSERT|CREATE|ALTER|TRUNCATE|REPLACE|MERGE|"
+        r"EXEC|EXECUTE|GRANT|REVOKE|CALL)\b",
+        re.IGNORECASE,
+    )
+
+    @staticmethod
+    def _validate_select_only(sql: str) -> str | None:
+        """
+        Returns an error string if the SQL is unsafe, else None.
+        Rules:
+          1. Must be a single statement (no semicolons except a trailing one).
+          2. Must start with SELECT (after stripping comments/whitespace).
+          3. Must not contain any write/DDL keyword anywhere in the statement.
+        """
+        # Strip leading/trailing whitespace and an optional trailing semicolon
+        cleaned = sql.strip().rstrip(";").strip()
+
+        # Rule 1 — no multiple statements
+        if ";" in cleaned:
+            return "Rejected: multiple statements are not allowed."
+
+        # Rule 2 — must start with SELECT
+        first_word = cleaned.split()[0].upper() if cleaned.split() else ""
+        if first_word != "SELECT":
+            return f"Rejected: only SELECT statements are allowed (got '{first_word}')."
+
+        # Rule 3 — no destructive keywords anywhere in the body
+        match = DBAdapter._BLOCKED_KEYWORDS.search(cleaned)
+        if match:
+            return f"Rejected: forbidden keyword '{match.group()}' found in query."
+
+        return None  # safe
+
     def run_query(self, sql: str) -> str:
         """
         Execute raw SQL — used by Agent 1 the same way as the original
         sql_query tool. Returns JSON string matching MIRA's expected shape.
+        Applies a safety gate: only single SELECT statements are permitted.
         """
+        safety_error = self._validate_select_only(sql)
+        if safety_error:
+            return json.dumps({
+                "error": safety_error,
+                "hint": "Only read-only SELECT queries are permitted.",
+            })
+
         try:
             df = pd.read_sql_query(sql, self.engine)
             if df.empty:
@@ -208,7 +251,7 @@ class DBAdapter:
         except Exception as e:
             return json.dumps({
                 "error": str(e),
-                "hint": "Check table/column names against the schema."
+                "hint": "Check table/column names against the schema.",
             })
 
     # ── Schema string for Agent 1 prompt ────────────────────────────────

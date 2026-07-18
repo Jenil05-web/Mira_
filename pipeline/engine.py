@@ -128,6 +128,7 @@ INSTALL (production extras beyond base requirements):
 import io
 import json
 import logging
+import math
 import os
 import pickle
 import re
@@ -160,17 +161,73 @@ logger = logging.getLogger(__name__)
 MAX_SQL_RETRIES = 2          # how many times we'll broaden a list query
 MIN_LIST_PATIENTS = 2        # below this, a "plural" question is treated as under-served
 
-# NEW — voice-input languages. Whisper's /translations endpoint always
-# outputs English regardless of spoken language, which is exactly what we
-# want here: the SQL/condition-vocabulary agents downstream only understand
-# English medical terms, so non-English speech is translated on the way in
-# rather than requiring the rest of the pipeline to be multilingual-aware.
 VOICE_LANGUAGE_CODES = {"english": "en", "hindi": "hi", "gujarati": "gu"}
+
+# ── Retry / backoff constants ─────────────────────────────────────────────
+_LLM_MAX_ATTEMPTS  = 3        # total attempts (1 original + 2 retries)
+_LLM_BASE_DELAY    = 1.0      # seconds before first retry
+_LLM_MAX_DELAY     = 30.0     # cap on exponential back-off
+_DB_QUERY_TIMEOUT  = 20       # seconds before a DB query is abandoned
+_CB_FAILURE_THRESH = 3        # consecutive failures before circuit opens
+_CB_RESET_AFTER    = 120      # seconds after which a tripped circuit re-tries
 
 
 from pipeline.state import *
 from pipeline.tools import *
 from pipeline.tools import _condition_sql_hints, _condition_search_terms, _distinct_patient_ids
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# PER-HOSPITAL CIRCUIT BREAKER
+# ══════════════════════════════════════════════════════════════════════════
+
+class _CircuitBreaker:
+    """
+    Simple per-hospital circuit breaker.
+    States: CLOSED (normal) → OPEN (stop sending) → HALF-OPEN (one probe).
+    A hospital's circuit opens after _CB_FAILURE_THRESH consecutive failures
+    and auto-resets after _CB_RESET_AFTER seconds.
+    """
+    def __init__(self):
+        self._failures: dict[str, int]   = {}
+        self._opened_at: dict[str, float] = {}
+
+    def record_success(self, hospital_id: str) -> None:
+        self._failures.pop(hospital_id, None)
+        self._opened_at.pop(hospital_id, None)
+
+    def record_failure(self, hospital_id: str) -> None:
+        self._failures[hospital_id] = self._failures.get(hospital_id, 0) + 1
+        if self._failures[hospital_id] >= _CB_FAILURE_THRESH:
+            if hospital_id not in self._opened_at:
+                self._opened_at[hospital_id] = time.monotonic()
+                logger.error(
+                    f"Circuit breaker OPENED for hospital '{hospital_id}' after "
+                    f"{_CB_FAILURE_THRESH} consecutive failures. Will retry after "
+                    f"{_CB_RESET_AFTER}s."
+                )
+
+    def is_open(self, hospital_id: str) -> bool:
+        opened = self._opened_at.get(hospital_id)
+        if opened is None:
+            return False
+        if time.monotonic() - opened > _CB_RESET_AFTER:
+            logger.info(f"Circuit breaker HALF-OPEN probe for '{hospital_id}'.")
+            return False   # allow one probe
+        return True
+
+    def degraded_response(self, hospital_id: str) -> str:
+        return json.dumps({
+            "error": (
+                f"Hospital '{hospital_id}' database is temporarily unavailable "
+                f"(circuit open after repeated failures). "
+                f"Please retry in {_CB_RESET_AFTER} seconds."
+            ),
+            "rows": [],
+        })
+
+
+_circuit_breaker = _CircuitBreaker()
 # ══════════════════════════════════════════════════════════════════════════
 # PRODUCTION ENGINE
 # ══════════════════════════════════════════════════════════════════════════
@@ -220,6 +277,36 @@ class MIRAEngineProd:
         # ── Build tools + graph ───────────────────────────────────────────
         self._build_tools()
         self._build_graph()
+
+    # ── LLM retry helper ────────────────────────────────────────────────
+    def _llm_with_retry(self, messages: list, caller: str = "llm"):
+        """
+        Invoke self.llm with exponential back-off on transient OpenAI errors
+        (rate limits, timeouts, connection resets). Raises on the final attempt.
+        """
+        import openai  # import here to avoid polluting the top-level namespace
+        _transient = (
+            openai.RateLimitError,
+            openai.APITimeoutError,
+            openai.APIConnectionError,
+            openai.InternalServerError,
+        )
+        delay = _LLM_BASE_DELAY
+        for attempt in range(1, _LLM_MAX_ATTEMPTS + 1):
+            try:
+                return self.llm.invoke(messages)
+            except _transient as exc:
+                if attempt == _LLM_MAX_ATTEMPTS:
+                    logger.error(f"{caller}: OpenAI transient error after "
+                                 f"{attempt} attempts: {exc}")
+                    raise
+                jitter = delay * (0.5 + 0.5 * (hash(str(exc)) % 100) / 100)
+                logger.warning(
+                    f"{caller}: transient OpenAI error (attempt {attempt}), "
+                    f"retrying in {jitter:.1f}s — {exc}"
+                )
+                time.sleep(jitter)
+                delay = min(delay * 2, _LLM_MAX_DELAY)
 
     def _build_checkpointer(self):
         ckpt_cfg = self.cfg.get_checkpoint_config()
@@ -295,10 +382,67 @@ class MIRAEngineProd:
 
     # ── Data adapter per hospital ────────────────────────────────────────
     def _get_adapter(self, hospital_id: str):
-        if hospital_id not in self._adapters:
-            data_cfg = self.cfg.get_data_source(hospital_id)
-            self._adapters[hospital_id] = create_adapter(data_cfg)
-        return self._adapters[hospital_id]
+        """
+        Returns the adapter for a hospital.  On first load:
+          1. Validates the config is not obviously malformed (fail-fast).
+          2. Tests the actual DB connection and raises a clear error if it fails
+             rather than propagating opaque exceptions three agents deep.
+          3. Checks the circuit breaker — if the hospital is tripped, raises
+             immediately instead of spending time on a doomed connection.
+        """
+        if hospital_id in self._adapters:
+            return self._adapters[hospital_id]
+
+        # ── Circuit breaker check ────────────────────────────────────────
+        if _circuit_breaker.is_open(hospital_id):
+            raise RuntimeError(
+                f"Hospital '{hospital_id}' circuit breaker is open — "
+                "connection has failed repeatedly. Retry in a few minutes."
+            )
+
+        # ── Config validation (fail fast) ────────────────────────────────
+        data_cfg = self.cfg.get_data_source(hospital_id)
+        source_type = data_cfg.get("type", "")
+        if source_type == "fhir":
+            fhir_url = data_cfg.get("base_url", "").strip()
+            if not fhir_url:
+                raise ValueError(
+                    f"Hospital '{hospital_id}' FHIR config is missing 'base_url'. "
+                    "Fix the hospital configuration before running queries."
+                )
+        elif source_type in ("sql", "postgres", "postgresql", "sqlite", ""):
+            conn_str = data_cfg.get("connection_string", "").strip()
+            if not conn_str:
+                raise ValueError(
+                    f"Hospital '{hospital_id}' SQL config is missing "
+                    "'connection_string'. Fix the hospital configuration."
+                )
+
+        # ── Attempt to build adapter + test connectivity ──────────────────
+        try:
+            adapter = create_adapter(data_cfg)
+            # For SQL adapters: run a cheap sanity-check query immediately
+            # so we surface a bad connection string NOW, not mid-query.
+            if isinstance(adapter, DBAdapter):
+                try:
+                    with adapter.engine.connect() as _conn:
+                        _conn.execute(__import__("sqlalchemy").text("SELECT 1"))
+                except Exception as conn_exc:
+                    _circuit_breaker.record_failure(hospital_id)
+                    raise ConnectionError(
+                        f"Hospital '{hospital_id}' database connection failed at startup: "
+                        f"{conn_exc}. Check the connection string and DB availability."
+                    ) from conn_exc
+            self._adapters[hospital_id] = adapter
+            _circuit_breaker.record_success(hospital_id)
+            return adapter
+        except (ValueError, ConnectionError):
+            raise   # already descriptive — let it propagate
+        except Exception as exc:
+            _circuit_breaker.record_failure(hospital_id)
+            raise RuntimeError(
+                f"Failed to initialise adapter for hospital '{hospital_id}': {exc}"
+            ) from exc
 
     def _get_trend_agent(self, hospital_id: str) -> Optional[TrendAgent]:
         if hospital_id not in self._trend_agents:
@@ -540,15 +684,43 @@ VOCABULARY:
   these exact names.
 - Return ONLY raw SQL, no markdown, no explanation.{broaden_note}"""
 
-        response = self.llm.invoke([
+        response = self._llm_with_retry([
             SystemMessage(content=system_prompt),
             HumanMessage(content=f"Clinical question: {question}")
-        ])
+        ], caller="agent1_sql_gen")
         raw_sql = response.content.strip().replace("```sql", "").replace("```", "").strip()
         result = self.sql_query_tool.invoke({"query": raw_sql, "hospital_id": hospital_id})
         parsed = json.loads(result)
         rows = parsed.get("rows", [])
         used_fallback = False
+
+        # ── Hard stop on security rejections — never fall back to broad query ──
+        # If the safety gate rejected the SQL (error starts with "Rejected:"),
+        # return immediately with a security_rejected status. Do NOT silently
+        # hand this off to get_broad_abnormal_labs — that would mean an
+        # injection attempt always gets data through the fallback path.
+        gate_error = parsed.get("error", "")
+        if gate_error.startswith("Rejected:"):
+            duration = int((time.monotonic() - start) * 1000)
+            self.audit.log_agent_run(
+                "data_extractor", state.get("session_id", ""),
+                duration, False, rows_returned=0,
+                user_id=state.get("user_id", ""), hospital_id=hospital_id,
+            )
+            rejection_msg = json.dumps({
+                "rows": [],
+                "error": gate_error,
+                "security_rejection": True,
+            })
+            return {**state,
+                    "sql_query_used": raw_sql,
+                    "sql_result": rejection_msg,
+                    "sql_error": gate_error,
+                    "sql_retry_count": retry_count,
+                    "data_status": "security_rejected",
+                    "requested_patient_ids": [],
+                    "found_patient_ids": [],
+                    "missing_patient_ids": []}
 
         if "error" in parsed or len(rows) == 0:
             logger.info("Generated SQL returned 0 rows or error; using adapter broad fallback.")
@@ -660,7 +832,7 @@ VOCABULARY:
         intent = state.get("query_intent", {})
         condition_terms = _condition_search_terms(intent.get("conditions", []))
 
-        response = self.llm.invoke([
+        response = self._llm_with_retry([
             SystemMessage(content=(
                 "Extract the SPECIFIC lab test names and their abnormal direction "
                 "(high/low) from the patient data. Write a semantic search query using "
@@ -668,7 +840,7 @@ VOCABULARY:
             )),
             HumanMessage(content=f"Question: {question}\n"
                                   f"Patient data: {sql_context[:1000]}")
-        ])
+        ], caller="agent2_semantic")
         search_query = response.content.strip()
         if condition_terms:
             search_query = f"{search_query} {condition_terms}".strip()
@@ -812,12 +984,12 @@ IMPORTANT GUIDELINES:
         question = state.get("clinical_question", "") or state.get("question", "") or ""
 
         start = time.monotonic()
-        response = self.llm.invoke([
+        response = self._llm_with_retry([
             SystemMessage(content=system_prompt),
             HumanMessage(content=f"Question: {question}\n\n"
                                   f"PATIENT DATA:\n{sql_result[:2000]}\n\n"
                                   f"GUIDELINES:\n{guideline_text[:2000]}")
-        ])
+        ], caller="clinical_reasoning")
         reasoning = response.content.strip()
         duration = int((time.monotonic() - start) * 1000)
 
@@ -903,12 +1075,12 @@ Respond ONLY in JSON:
 {"approved": true/false, "safety_flags": [], "corrections": "...", "final_report": "..."}"""
 
         start = time.monotonic()
-        response = self.llm.invoke([
-            SystemMessage(content=system_prompt),
-            HumanMessage(content=f"PATIENT DATA (ground truth):\n{sql_result[:1500]}\n\n"
-                                  f"GUIDELINES:\n{guidelines[:1000]}\n\n"
-                                  f"DRAFT:\n{reasoning}")
-        ])
+        response = self._llm_with_retry([\r
+            SystemMessage(content=system_prompt),\r
+            HumanMessage(content=f"PATIENT DATA (ground truth):\\n{sql_result[:1500]}\\n\\n"\r
+                                  f"GUIDELINES:\\n{guidelines[:1000]}\\n\\n"\r
+                                  f"DRAFT:\\n{reasoning}")\r
+        ], caller="agent4_critic")
         duration = int((time.monotonic() - start) * 1000)
 
         try:
@@ -1112,12 +1284,53 @@ Respond ONLY in JSON:
             return {"clinical_question": "", "original_transcript": "",
                     "spoken_language": spoken_language, "error": str(e)}
 
+    # ── Question-level injection guard ───────────────────────────────────
+    # Detects SQL injection embedded directly in the clinical question string
+    # (e.g. "show me patient 1; DELETE FROM patients"). This is a separate
+    # attack vector from the SQL gate in run_query (which catches harmful
+    # LLM-generated SQL). Here we catch it BEFORE the LLM sees the input.
+    _QUESTION_INJECTION = re.compile(
+        r";\s*(DROP|DELETE|UPDATE|INSERT|CREATE|ALTER|TRUNCATE|REPLACE|MERGE|"
+        r"EXEC|EXECUTE|GRANT|REVOKE)\b",
+        re.IGNORECASE,
+    )
+
+    def _check_question_injection(self, question: str) -> str | None:
+        """Returns a rejection reason string if question looks injected, else None."""
+        m = self._QUESTION_INJECTION.search(question)
+        if m:
+            return f"Rejected: forbidden SQL keyword '{m.group(1)}' detected in question."
+        return None
+
     def run_until_review(self, clinical_question: str, config: dict,
                          user_id: str = "anon", hospital_id: str = "demo",
                          session_id: str = "",
                          input_mode: str = "text",
                          spoken_language: str = "",
                          original_transcript: str = "") -> MIRAState:
+
+        # ── Hard gate: reject questions that contain SQL injection patterns ──
+        rejection = self._check_question_injection(clinical_question)
+        if rejection:
+            self.audit.log_query(user_id, hospital_id, session_id,
+                                 config["configurable"]["thread_id"],
+                                 clinical_question, len(clinical_question))
+            rejection_result = json.dumps({
+                "rows": [], "error": rejection, "security_rejection": True
+            })
+            return {
+                **make_initial_state(clinical_question, user_id, hospital_id,
+                                     session_id, input_mode=input_mode),
+                "sql_result":  rejection_result,
+                "sql_error":   rejection,
+                "data_status": "security_rejected",
+                "clinical_reasoning": (
+                    "This question was blocked before processing: it contains a "
+                    "SQL injection pattern that is not permitted."
+                ),
+                "safety_flags": ["question_injection_blocked"],
+            }
+
         initial = make_initial_state(clinical_question, user_id, hospital_id, session_id,
                                      input_mode=input_mode, spoken_language=spoken_language,
                                      original_transcript=original_transcript)
@@ -1316,7 +1529,10 @@ Identify up to the 5 most critical patients based on these labs. For each, provi
 
 Return ONLY a valid JSON array of objects with these exact keys. No markdown."""
         try:
-            response = self.llm.invoke([SystemMessage(content=prompt)])
+            response = self._llm_with_retry(
+            [SystemMessage(content=prompt)],
+            caller="ambient_soap"
+        )
             content = response.content.replace("```json", "").replace("```", "").strip()
             triage_data = json.loads(content)
             # Sort by severity descending
