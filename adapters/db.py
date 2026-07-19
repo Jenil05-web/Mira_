@@ -115,7 +115,22 @@ class DBAdapter:
           MySQL     : mysql+pymysql://user:pass@host:3306/db
         """
         self.connection_string = connection_string
-        self.engine = create_engine(connection_string)
+        # Set connection-level timeouts so a slow or dead DB never hangs
+        # the request indefinitely.  Values are conservative but bounded.
+        db_type = connection_string.split(":")[0].lower()
+        if "sqlite" in db_type:
+            connect_args = {"timeout": 15}          # SQLite busy-timeout (s)
+            engine_kwargs = {"connect_args": connect_args}
+        elif "postgres" in db_type or "pg" in db_type:
+            connect_args = {"connect_timeout": 10}  # PostgreSQL TCP timeout (s)
+            engine_kwargs = {
+                "connect_args": connect_args,
+                "pool_timeout": 15,   # wait for pool slot (s)
+                "pool_recycle": 1800, # recycle stale connections every 30 min
+            }
+        else:
+            engine_kwargs = {}  # MySQL/other — driver defaults
+        self.engine = create_engine(connection_string, **engine_kwargs)
         self._schema_cache: Optional[dict] = None
         self._table_map: Optional[dict] = None
 
@@ -231,6 +246,8 @@ class DBAdapter:
         Execute raw SQL — used by Agent 1 the same way as the original
         sql_query tool. Returns JSON string matching MIRA's expected shape.
         Applies a safety gate: only single SELECT statements are permitted.
+        On transient DB errors retries once, then returns a clean error message
+        rather than hanging or propagating an opaque exception.
         """
         safety_error = self._validate_select_only(sql)
         if safety_error:
@@ -239,20 +256,33 @@ class DBAdapter:
                 "hint": "Only read-only SELECT queries are permitted.",
             })
 
-        try:
+        def _execute() -> str:
             df = pd.read_sql_query(sql, self.engine)
             if df.empty:
                 return json.dumps({"result": "No data found."})
             return json.dumps(
                 {"rows": df.head(25).to_dict(orient="records"),
                  "total_returned": len(df)},
-                default=str
+                default=str,
             )
-        except Exception as e:
-            return json.dumps({
-                "error": str(e),
-                "hint": "Check table/column names against the schema.",
-            })
+
+        try:
+            return _execute()
+        except Exception as first_exc:
+            # One retry: dispose stale pool connections then try again
+            logger.warning(f"run_query: first attempt failed ({first_exc}), retrying once.")
+            try:
+                self.engine.dispose()
+                return _execute()
+            except Exception as second_exc:
+                logger.error(f"run_query: retry also failed: {second_exc}")
+                return json.dumps({
+                    "error": (
+                        "Database connection is temporarily unavailable. "
+                        "Please try again in a moment."
+                    ),
+                    "hint": "Check table/column names against the schema.",
+                })
 
     # ── Schema string for Agent 1 prompt ────────────────────────────────
     def get_schema_description(self) -> str:

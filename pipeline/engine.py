@@ -308,6 +308,37 @@ class MIRAEngineProd:
                 time.sleep(jitter)
                 delay = min(delay * 2, _LLM_MAX_DELAY)
 
+    # ── Whisper retry helper ───────────────────────────────────────────────
+    def _whisper_with_retry(self, call_fn, caller: str = "whisper"):
+        """
+        Run a Whisper API call (passed as a zero-argument lambda) with
+        exponential back-off on transient OpenAI errors, identical policy
+        to _llm_with_retry.
+        """
+        import openai
+        _transient = (
+            openai.RateLimitError,
+            openai.APITimeoutError,
+            openai.APIConnectionError,
+            openai.InternalServerError,
+        )
+        delay = _LLM_BASE_DELAY
+        for attempt in range(1, _LLM_MAX_ATTEMPTS + 1):
+            try:
+                return call_fn()
+            except _transient as exc:
+                if attempt == _LLM_MAX_ATTEMPTS:
+                    logger.error(f"{caller}: Whisper transient error after "
+                                 f"{attempt} attempts: {exc}")
+                    raise
+                jitter = delay * (0.5 + 0.5 * (hash(str(exc)) % 100) / 100)
+                logger.warning(
+                    f"{caller}: transient Whisper error (attempt {attempt}), "
+                    f"retrying in {jitter:.1f}s — {exc}"
+                )
+                time.sleep(jitter)
+                delay = min(delay * 2, _LLM_MAX_DELAY)
+
     def _build_checkpointer(self):
         ckpt_cfg = self.cfg.get_checkpoint_config()
         self._ckpt_cfg = ckpt_cfg  # saved for auto-reconnect
@@ -1075,11 +1106,16 @@ Respond ONLY in JSON:
 {"approved": true/false, "safety_flags": [], "corrections": "...", "final_report": "..."}"""
 
         start = time.monotonic()
-        response = self._llm_with_retry([\r
-            SystemMessage(content=system_prompt),\r
-            HumanMessage(content=f"PATIENT DATA (ground truth):\\n{sql_result[:1500]}\\n\\n"\r
-                                  f"GUIDELINES:\\n{guidelines[:1000]}\\n\\n"\r
-                                  f"DRAFT:\\n{reasoning}")\r
+        response = self._llm_with_retry([
+            SystemMessage(content=system_prompt),
+            HumanMessage(content=(
+                "PATIENT DATA (ground truth):\n"
+                f"{sql_result[:1500]}\n\n"
+                "GUIDELINES:\n"
+                f"{guidelines[:1000]}\n\n"
+                "DRAFT:\n"
+                f"{reasoning}"
+            ))
         ], caller="agent4_critic")
         duration = int((time.monotonic() - start) * 1000)
 
@@ -1227,16 +1263,20 @@ Respond ONLY in JSON:
                 # back at all. Note Whisper returns the FULL language name in
                 # lowercase English (e.g. "english", "hindi", "gujarati"), not
                 # an ISO code — so we compare against that, not "en".
-                verbatim_resp = self.openai_client.audio.transcriptions.create(
-                    model="whisper-1", file=_make_audio_file(), response_format="verbose_json"
+                verbatim_resp = self._whisper_with_retry(
+                    lambda: self.openai_client.audio.transcriptions.create(
+                        model="whisper-1", file=_make_audio_file(), response_format="verbose_json"
+                    ), caller="whisper_verbatim"
                 )
                 detected_lang = (getattr(verbatim_resp, "language", None) or "english").lower()
                 original_text = verbatim_resp.text.strip()
 
                 # If Whisper detected non-English, translate to English
                 if detected_lang not in ("english", "en"):
-                    translated_resp = self.openai_client.audio.translations.create(
-                        model="whisper-1", file=_make_audio_file()
+                    translated_resp = self._whisper_with_retry(
+                        lambda: self.openai_client.audio.translations.create(
+                            model="whisper-1", file=_make_audio_file()
+                        ), caller="whisper_translate_auto"
                     )
                     english_text = translated_resp.text.strip()
                 else:
@@ -1249,8 +1289,10 @@ Respond ONLY in JSON:
                     "detected_language": detected_lang,
                 }
             elif spoken_language == "english":
-                resp = self.openai_client.audio.transcriptions.create(
-                    model="whisper-1", file=_make_audio_file(), language="en"
+                resp = self._whisper_with_retry(
+                    lambda: self.openai_client.audio.transcriptions.create(
+                        model="whisper-1", file=_make_audio_file(), language="en"
+                    ), caller="whisper_en"
                 )
                 text = resp.text.strip()
                 result = {"clinical_question": text, "original_transcript": text,
@@ -1262,11 +1304,15 @@ Respond ONLY in JSON:
                 # English translation (for the pipeline) — two calls, but
                 # each is cheap, and correctness/auditability here matters
                 # more than saving one Whisper call.
-                verbatim_resp = self.openai_client.audio.transcriptions.create(
-                    model="whisper-1", file=_make_audio_file(), language=lang_code
+                verbatim_resp = self._whisper_with_retry(
+                    lambda: self.openai_client.audio.transcriptions.create(
+                        model="whisper-1", file=_make_audio_file(), language=lang_code
+                    ), caller="whisper_verbatim_lang"
                 )
-                translated_resp = self.openai_client.audio.translations.create(
-                    model="whisper-1", file=_make_audio_file()
+                translated_resp = self._whisper_with_retry(
+                    lambda: self.openai_client.audio.translations.create(
+                        model="whisper-1", file=_make_audio_file()
+                    ), caller="whisper_translate_lang"
                 )
                 result = {
                     "clinical_question": translated_resp.text.strip(),
@@ -1366,6 +1412,27 @@ Respond ONLY in JSON:
                     current_state = {}
             else:
                 current_state = {}
+
+        # ── Idempotency guard ─────────────────────────────────────────────────
+        # A doctor double-clicking "Approve" (or the UI retrying a POST) must
+        # not re-run the critic agent or double-log the audit event.
+        # If the state already shows a finalised decision that matches the
+        # incoming one, return immediately.
+        existing_decision = current_state.get("human_decision", "")
+        already_approved  = current_state.get("approved", False)
+        if decision == "approve" and already_approved:
+            logger.info(
+                f"submit_human_decision: duplicate 'approve' on thread {thread_id} — "
+                "returning cached final state (idempotent)."
+            )
+            return current_state
+        if decision == "reject" and existing_decision == "reject" and not feedback:
+            # Reject with no new feedback on an already-rejected state — no-op.
+            logger.info(
+                f"submit_human_decision: duplicate 'reject' (no new feedback) on "
+                f"thread {thread_id} — returning cached state (idempotent)."
+            )
+            return current_state
 
         # MemorySaver lost state (e.g. a process restart). FIX: only trust
         # a frontend-supplied paused_state if it actually matches the
