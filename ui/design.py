@@ -520,6 +520,30 @@ hr { border-color: var(--line) !important; margin: 20px 0 !important; }
     background: var(--glass) !important; backdrop-filter: blur(16px) !important;
     border-right: 1px solid var(--line) !important;
 }
+/* ── GLOBAL STREAMLIT LOADER OVERLAY ─────────────────────────────────── */
+/* Hides the default Streamlit running man and injects a MIRA pulsing logo */
+[data-testid="stStatusWidget"] {
+    visibility: hidden;
+}
+[data-testid="stStatusWidget"]::before {
+    content: '◍';
+    visibility: visible;
+    position: fixed;
+    top: 24px;
+    right: 24px;
+    width: 44px; height: 44px;
+    background: linear-gradient(145deg, #0F1C24, #1E8A7A);
+    border-radius: 12px;
+    display: flex; align-items: center; justify-content: center;
+    color: white; font-family: 'Newsreader', serif; font-size: 22px;
+    box-shadow: 0 4px 14px rgba(30,138,122,0.3), 0 0 0 1px rgba(255,255,255,0.1) inset;
+    animation: corner-pulse 1.8s ease-in-out infinite;
+    z-index: 999999;
+}
+@keyframes corner-pulse {
+    0%, 100% { transform: scale(1); box-shadow: 0 4px 14px rgba(30,138,122,0.3); }
+    50% { transform: scale(0.92); box-shadow: 0 2px 8px rgba(30,138,122,0.15); opacity: 0.85; }
+}
 </style>
 """
 
@@ -550,23 +574,23 @@ def render_mira_loader(step: int = 0):
 
         icon_cls = "active" if i == step else ("done" if i < step else "waiting")
         steps_html += f"""
-        <div class="mira-loader-step">
-            <div class="loader-step-icon {icon_cls}">{icon}</div>
-            <div style="flex:1;">
-                <div class="loader-step-text">{label}</div>
-                <div class="loader-step-status">{sub}</div>
-            </div>
-            {status_html}
-        </div>"""
+<div class="mira-loader-step">
+    <div class="loader-step-icon {icon_cls}">{icon}</div>
+    <div style="flex:1;">
+        <div class="loader-step-text">{label}</div>
+        <div class="loader-step-status">{sub}</div>
+    </div>
+    {status_html}
+</div>"""
 
     st.markdown(f"""
-    <div class="mira-loader-wrap">
-        <div class="mira-loader-logo">◍</div>
-        <div>
-            <div class="mira-loader-label">MIRA is working…</div>
-            <div class="mira-loader-sub">Your report will be ready for review shortly</div>
-        </div>
-        <div class="mira-loader-steps">
-            {steps_html}
-        </div>
-    </div>""", unsafe_allow_html=True)
+<div class="mira-loader-wrap">
+    <div class="mira-loader-logo">◍</div>
+    <div>
+        <div class="mira-loader-label">MIRA is working…</div>
+        <div class="mira-loader-sub">Your report will be ready for review shortly</div>
+    </div>
+    <div class="mira-loader-steps">
+        {steps_html}
+    </div>
+</div>""", unsafe_allow_html=True)
