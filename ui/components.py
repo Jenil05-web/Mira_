@@ -62,11 +62,15 @@ def render_fill_rail(stage: str):
     """, unsafe_allow_html=True)
 
 
-def render_processing_strip(message: str):
+def render_processing_strip(message: str, sub: str = "Please wait..."):
     st.markdown(f"""
     <div class="processing-strip">
-        <span class="processing-text">{message}</span>
-        <div class="shimmer-bar"></div>
+        <div class="processing-strip-icon">◍</div>
+        <div style="flex:1;">
+            <div class="processing-text">{message}</div>
+            <div class="processing-sub">{sub}</div>
+        </div>
+        <div class="shimmer-bar" style="max-width: 30%;"></div>
     </div>""", unsafe_allow_html=True)
 
 

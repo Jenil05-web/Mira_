@@ -664,9 +664,7 @@ with tab_audit:
         with right_col:
             ph = st.empty()
             with ph.container():
-                st.markdown('<div class="panel">', unsafe_allow_html=True)
-                render_processing_strip("Querying patient database")
-                st.markdown('</div>', unsafe_allow_html=True)
+                render_mira_loader(1)
 
             st.session_state.thread_config = engine.start_new_audit()
             paused = engine.run_until_review(
@@ -709,8 +707,11 @@ if tab_triage:
         should_run = (st.session_state.last_triage is None) or auto_refresh
         
         if should_run:
-            with st.spinner("Scanning hospital records & calculating severity..."):
-                st.session_state.last_triage = engine.run_triage(user.hospital_id, limit=60)
+            ph = st.empty()
+            with ph.container():
+                render_mira_loader(2)
+            st.session_state.last_triage = engine.run_triage(user.hospital_id, limit=60)
+            ph.empty()
             
         triage_data = st.session_state.last_triage
         
