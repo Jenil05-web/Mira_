@@ -136,25 +136,20 @@ header[data-testid="stHeader"] { background: transparent; }
     background: linear-gradient(145deg, #0F1C24, #1E8A7A);
     display: flex; align-items: center; justify-content: center;
     font-family: 'Newsreader', serif; font-weight: 600; font-size: 32px; color: #F8F9FA;
-    box-shadow: 0 0 0 0 rgba(30,138,122,0.5);
-    animation: logo-pulse 2s ease-in-out infinite;
+    box-shadow: 0 4px 14px rgba(30,138,122,0.3);
+    animation: m-pulse 2s cubic-bezier(0.4, 0, 0.2, 1) infinite;
     position: relative;
+    border: 1px solid rgba(255,255,255,0.1);
 }
-.mira-loader-logo::after {
-    content: '';
-    position: absolute; inset: -8px; border-radius: 28px;
-    background: linear-gradient(135deg, rgba(30,138,122,0.3), rgba(14,94,82,0.1));
-    animation: ring-spin 3s linear infinite;
-    border: 1.5px solid rgba(30,138,122,0.35);
-}
-@keyframes logo-pulse {
-    0%, 100% { box-shadow: 0 0 0 0 rgba(30,138,122,0.4), 0 8px 24px rgba(30,138,122,0.2); transform: scale(1); }
-    50%       { box-shadow: 0 0 0 12px rgba(30,138,122,0), 0 8px 32px rgba(30,138,122,0.35); transform: scale(1.04); }
-}
-@keyframes ring-spin {
-    0%   { transform: rotate(0deg) scale(1); opacity: 0.8; }
-    50%  { transform: rotate(180deg) scale(1.05); opacity: 0.4; }
-    100% { transform: rotate(360deg) scale(1); opacity: 0.8; }
+@keyframes m-pulse {
+    0%, 100% { 
+        box-shadow: 0 4px 14px rgba(30,138,122,0.3), 0 0 0 0 rgba(30,138,122,0.4); 
+        transform: scale(1); 
+    }
+    50% { 
+        box-shadow: 0 8px 32px rgba(30,138,122,0.5), 0 0 0 12px rgba(30,138,122,0); 
+        transform: scale(1.08); 
+    }
 }
 .mira-loader-label {
     font-family: 'Newsreader', serif; font-size: 20px; font-weight: 500;
@@ -521,28 +516,64 @@ hr { border-color: var(--line) !important; margin: 20px 0 !important; }
     border-right: 1px solid var(--line) !important;
 }
 /* ── GLOBAL STREAMLIT LOADER OVERLAY ─────────────────────────────────── */
-/* Hides the default Streamlit running man and injects a MIRA pulsing logo */
+/* Hides the default Streamlit running man and injects a MIRA full-screen animated loader */
 [data-testid="stStatusWidget"] {
     visibility: hidden;
 }
-[data-testid="stStatusWidget"]::before {
-    content: '◍';
+/* Subtle black background overlay */
+[data-testid="stStatusWidget"]::after {
+    content: '';
     visibility: visible;
     position: fixed;
-    top: 24px;
-    right: 24px;
-    width: 44px; height: 44px;
-    background: linear-gradient(145deg, #0F1C24, #1E8A7A);
-    border-radius: 12px;
-    display: flex; align-items: center; justify-content: center;
-    color: white; font-family: 'Newsreader', serif; font-size: 22px;
-    box-shadow: 0 4px 14px rgba(30,138,122,0.3), 0 0 0 1px rgba(255,255,255,0.1) inset;
-    animation: corner-pulse 1.8s ease-in-out infinite;
-    z-index: 999999;
+    inset: 0;
+    background: rgba(15, 28, 36, 0.4);
+    backdrop-filter: blur(4px);
+    z-index: 999998;
+    animation: fade-in 0.3s ease-out forwards;
 }
-@keyframes corner-pulse {
-    0%, 100% { transform: scale(1); box-shadow: 0 4px 14px rgba(30,138,122,0.3); }
-    50% { transform: scale(0.92); box-shadow: 0 2px 8px rgba(30,138,122,0.15); opacity: 0.85; }
+/* Centered animated M logo */
+[data-testid="stStatusWidget"]::before {
+    content: 'M';
+    visibility: visible;
+    position: fixed;
+    top: 50%;
+    left: 50%;
+    margin-top: -36px;
+    margin-left: -36px;
+    width: 72px; height: 72px;
+    background: linear-gradient(145deg, #0F1C24, #1E8A7A);
+    border-radius: 20px;
+    display: flex; align-items: center; justify-content: center;
+    color: white; font-family: 'Newsreader', serif; font-size: 32px;
+    box-shadow: 0 8px 32px rgba(0,0,0,0.3), 0 0 0 1px rgba(255,255,255,0.1) inset;
+    z-index: 999999;
+    animation: center-m-pulse 2.5s cubic-bezier(0.4, 0, 0.2, 1) infinite;
+}
+@keyframes fade-in {
+    from { opacity: 0; }
+    to { opacity: 1; }
+}
+@keyframes center-m-pulse {
+    0% { 
+        transform: scale(1) rotate(0deg); 
+        box-shadow: 0 8px 24px rgba(30,138,122,0.4), 0 0 0 0 rgba(30,138,122,0.4);
+    }
+    25% {
+        transform: scale(1.12) rotate(3deg);
+        box-shadow: 0 12px 32px rgba(30,138,122,0.6), 0 0 0 16px rgba(30,138,122,0);
+    }
+    50% {
+        transform: scale(0.95) rotate(-2deg);
+        box-shadow: 0 4px 16px rgba(30,138,122,0.2), 0 0 0 0 rgba(30,138,122,0);
+    }
+    75% {
+        transform: scale(1.05) rotate(1deg);
+        box-shadow: 0 10px 28px rgba(30,138,122,0.5), 0 0 0 8px rgba(30,138,122,0);
+    }
+    100% { 
+        transform: scale(1) rotate(0deg); 
+        box-shadow: 0 8px 24px rgba(30,138,122,0.4), 0 0 0 0 rgba(30,138,122,0);
+    }
 }
 </style>
 """
@@ -585,7 +616,7 @@ def render_mira_loader(step: int = 0):
 
     st.markdown(f"""
 <div class="mira-loader-wrap">
-    <div class="mira-loader-logo">◍</div>
+    <div class="mira-loader-logo">M</div>
     <div>
         <div class="mira-loader-label">MIRA is working…</div>
         <div class="mira-loader-sub">Your report will be ready for review shortly</div>

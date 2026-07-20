@@ -92,7 +92,7 @@ from pipeline.ambient import AmbientConsultEngine
 
 st.set_page_config(
     page_title="MIRA — Clinical Audit Console",
-    page_icon="◍",
+    page_icon="M",
     layout="wide",
     initial_sidebar_state="collapsed",
 )
@@ -474,7 +474,7 @@ with tab_audit:
         if st.session_state.stage == "idle":
             st.markdown("""
             <div class="empty-state">
-                <div class="mark">◍</div>
+                <div class="mark">M</div>
                 <div class="heading">No audit running</div>
                 <div class="sub">Enter a clinical question on the left. MIRA queries the patient
                 database, cross-references medical guidelines, and prepares a report for your

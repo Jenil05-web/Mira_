@@ -65,7 +65,7 @@ def render_fill_rail(stage: str):
 def render_processing_strip(message: str, sub: str = "Please wait..."):
     st.markdown(f"""
     <div class="processing-strip">
-        <div class="processing-strip-icon">◍</div>
+        <div class="processing-strip-icon">M</div>
         <div style="flex:1;">
             <div class="processing-text">{message}</div>
             <div class="processing-sub">{sub}</div>
