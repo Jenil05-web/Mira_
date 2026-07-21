@@ -62,6 +62,22 @@ def render_fill_rail(stage: str):
     """, unsafe_allow_html=True)
 
 
+def render_skeleton_panel():
+    st.markdown("""
+    <div class="skeleton-panel">
+        <div class="skeleton-line title"></div>
+        <div class="skeleton-line"></div>
+        <div class="skeleton-line"></div>
+        <div class="skeleton-line short"></div>
+    </div>
+    <div class="skeleton-panel">
+        <div class="skeleton-line title"></div>
+        <div class="skeleton-line"></div>
+        <div class="skeleton-line short"></div>
+    </div>
+    """, unsafe_allow_html=True)
+
+
 def render_processing_strip(message: str, sub: str = "Please wait..."):
     st.markdown(f"""
     <div class="processing-strip">

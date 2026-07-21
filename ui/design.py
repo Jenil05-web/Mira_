@@ -79,6 +79,12 @@ header[data-testid="stHeader"] { background: transparent; }
     transform: scale(1.06) rotate(-2deg);
     box-shadow: var(--shadow-lg), 0 0 0 1px rgba(255,255,255,0.1) inset;
 }
+.mira-mark.is-thinking { position: relative; }
+.mira-mark.is-thinking::before {
+    content: ''; position: absolute; inset: -4px;
+    border-radius: 16px; background: var(--teal); opacity: 0.3;
+    animation: breathe 2.4s ease-in-out infinite; z-index: -1;
+}
 .mira-title {
     font-family: 'Newsreader', serif; font-size: 22px; font-weight: 500;
     color: var(--ink); line-height: 1.1; letter-spacing: -0.01em;
@@ -103,6 +109,15 @@ header[data-testid="stHeader"] { background: transparent; }
     content: ''; position: absolute; top: -4px; left: -4px;
     width: 15px; height: 15px; border-radius: 50%;
     background: var(--teal); opacity: 0.3;
+    animation: breathe 2.4s ease-in-out infinite;
+}
+.record-dot {
+    width: 10px; height: 10px; border-radius: 50%; background: #C9501F;
+    position: relative; flex-shrink: 0; display: inline-block;
+}
+.record-dot::before {
+    content: ''; position: absolute; inset: -5px;
+    border-radius: 50%; background: #C9501F; opacity: 0.3;
     animation: breathe 2.4s ease-in-out infinite;
 }
 @keyframes breathe {
@@ -349,7 +364,7 @@ div[data-testid="stMarkdownContainer"] strong { color: var(--ink) !important; fo
     box-shadow: var(--shadow-md) !important;
     transform: translateY(-1px) !important;
 }
-.stButton button:active { transform: translateY(0px) !important; box-shadow: var(--shadow-sm) !important; }
+.stButton button:active { transform: scale(0.97) !important; transition: transform 0.1s ease-out !important; }
 .stButton button p, .stButton button span, .stButton button div { color: inherit !important; }
 
 /* Primary button */
@@ -399,11 +414,12 @@ div[data-testid="stButton"] button[kind="primary"]:hover {
     display: flex; align-items: center; justify-content: center; margin: 0 auto 20px auto;
     font-family: 'Newsreader', serif; font-size: 24px; color: var(--slate-2);
     box-shadow: var(--shadow-sm);
-    animation: float 4s ease-in-out infinite;
+    position: relative;
 }
-@keyframes float {
-    0%, 100% { transform: translateY(0); }
-    50%       { transform: translateY(-5px); }
+.empty-state .mark::before {
+    content: ''; position: absolute; inset: -4px;
+    border-radius: 20px; background: var(--slate-2); opacity: 0.2;
+    animation: breathe 3s ease-in-out infinite; z-index: -1;
 }
 .empty-state .heading {
     font-family: 'Newsreader', serif; font-size: 20px; font-weight: 500;
@@ -479,12 +495,50 @@ div[data-testid="stButton"] button[kind="primary"]:hover {
 }
 
 /* ── TRANSITIONS for page elements ───────────────────────────────────── */
+.panel, .banner, .mira-loader-wrap, .skeleton-panel {
+    animation: slide-up 0.2s ease-out both;
+}
+@keyframes slide-up {
+    from { opacity: 0; transform: translateY(12px); }
+    to   { opacity: 1; transform: translateY(0); }
+}
 [data-testid="stVerticalBlock"] > div {
     animation: fade-up 0.3s var(--ease-out) both;
 }
 @keyframes fade-up {
     from { opacity: 0; transform: translateY(6px); }
     to   { opacity: 1; transform: translateY(0); }
+}
+
+/* ── SKELETON PLACEHOLDERS ───────────────────────────────────────────── */
+.skeleton-panel {
+    background: var(--glass); backdrop-filter: blur(12px);
+    border: 1px solid rgba(255,255,255,0.8);
+    border-radius: var(--radius-lg); padding: 24px 26px; margin-top: 16px; margin-bottom: 16px;
+}
+.skeleton-line {
+    height: 12px; background: rgba(0,0,0,0.05);
+    border-radius: 6px; margin-bottom: 14px;
+    animation: shimmer-pulse 1.5s ease-in-out infinite;
+}
+.skeleton-line.short { width: 60%; }
+.skeleton-line.title { height: 16px; width: 30%; margin-bottom: 24px; }
+@keyframes shimmer-pulse {
+    0%, 100% { opacity: 0.5; }
+    50% { opacity: 1; }
+}
+
+/* ── BANNER ANIMATED CHECKMARK ───────────────────────────────────────── */
+.banner-approved svg.check {
+    width: 16px; height: 16px; flex-shrink: 0;
+}
+.banner-approved svg.check path {
+    stroke-dasharray: 24; stroke-dashoffset: 24;
+    animation: draw-check 0.4s ease-out forwards;
+    animation-delay: 0.1s;
+}
+@keyframes draw-check {
+    100% { stroke-dashoffset: 0; }
 }
 
 /* ── EXPANDER ────────────────────────────────────────────────────────── */
@@ -519,6 +573,11 @@ hr { border-color: var(--line) !important; margin: 20px 0 !important; }
 /* Hides the default Streamlit running man and injects a MIRA full-screen animated loader */
 [data-testid="stStatusWidget"] {
     visibility: hidden;
+}
+/* Disable global overlay if MIRA custom loader is active */
+[data-testid="stApp"]:has(.mira-loader-wrap) [data-testid="stStatusWidget"]::before,
+[data-testid="stApp"]:has(.mira-loader-wrap) [data-testid="stStatusWidget"]::after {
+    display: none !important;
 }
 /* Subtle black background overlay */
 [data-testid="stStatusWidget"]::after {

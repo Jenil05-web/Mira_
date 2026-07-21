@@ -270,11 +270,13 @@ if not user:
 # ══════════════════════════════════════════════════════════════════════════
 
 role_dot_class = "admin" if user.role == Role.ADMIN else "clinician"
+is_running = st.session_state.stage == "running" or st.session_state.get("_ambient_processing")
+mark_cls = "mira-mark is-thinking" if is_running else "mira-mark"
 
 st.markdown(f"""
 <div class="mira-header">
     <div class="mira-header-left">
-        <div class="mira-mark">M</div>
+        <div class="{mark_cls}">M</div>
         <div>
             <div class="mira-title">MIRA Clinical Audit Console</div>
             <div class="mira-subtitle">Cross-referencing live patient data against medical guidelines</div>
@@ -405,10 +407,10 @@ with tab_audit:
                 except Exception as exc:
                     result = {"error": str(exc)}
                 ph.empty()
-                if result.get("error"):
+                if "error" in result:
                     st.error(f"Transcription failed: {result['error']}")
-                elif not result.get("clinical_question"):
-                    st.warning("No speech detected — please try recording again.")
+                elif not result.get("clinical_question", "").strip():
+                    st.warning("No speech detected - please try recording again.")
                 else:
                     # FIX: stage the value instead of writing directly to
                     # st.session_state.question_input here — the widget
@@ -418,6 +420,7 @@ with tab_audit:
                     st.session_state.voice_original_transcript = result.get("original_transcript", "")
                     st.session_state.voice_spoken_language = result.get("detected_language") or result.get("spoken_language", "")
                     st.session_state.current_input_mode = "voice"
+                    st.toast("Transcription complete", icon="🎙️")
                     st.rerun()
 
             if (st.session_state.get("voice_original_transcript")
@@ -448,6 +451,7 @@ with tab_audit:
 
         if new_audit_clicked:
             reset_audit_session()
+            st.toast("New audit started", icon="✨")
             st.rerun()
 
         st.write("")
@@ -474,7 +478,7 @@ with tab_audit:
         if st.session_state.stage == "idle":
             st.markdown("""
             <div class="empty-state">
-                <div class="mark">M</div>
+                <div class="mark is-alive">M</div>
                 <div class="heading">No audit running</div>
                 <div class="sub">Enter a clinical question on the left. MIRA queries the patient
                 database, cross-references medical guidelines, and prepares a report for your
@@ -572,7 +576,7 @@ with tab_audit:
                 st.markdown(banner, unsafe_allow_html=True)
 
             if state.get("approved"):
-                st.markdown('<div class="banner banner-approved"><span>✓</span>'
+                st.markdown('<div class="banner banner-approved"><svg class="check" viewBox="0 0 10 8" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M1 4L3.5 6.5L9 1" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>'
                             'Cleared by safety review — all claims grounded in retrieved data</div>',
                             unsafe_allow_html=True)
             else:
@@ -665,6 +669,7 @@ with tab_audit:
             ph = st.empty()
             with ph.container():
                 render_mira_loader(1)
+                render_skeleton_panel()
 
             st.session_state.thread_config = engine.start_new_audit()
             paused = engine.run_until_review(
@@ -820,8 +825,7 @@ with tab_ambient:
         st.markdown(f"""
         <div style="background:#FFF5F5; border:1px solid #F5C6C6; border-radius:10px;
              padding:14px 20px; margin:8px 0; display:flex; align-items:center; gap:14px;">
-            <span style="width:10px;height:10px;border-radius:50%;background:#C9501F;
-                  display:inline-block;animation:blink 1s step-start infinite;"></span>
+            <span class="record-dot"></span>
             <div style="flex:1;">
                 <span style="font-weight:600;color:#C9501F;font-size:14.5px;">
                     Consult live &nbsp;&middot;&nbsp; <span id="amb-timer">00:00</span>
@@ -916,7 +920,7 @@ with tab_ambient:
             st.markdown(f'<div class="banner banner-flagged"><span>▲</span>Safety review flagged potential issues: {"; ".join(flags)}</div>',
                         unsafe_allow_html=True)
         else:
-            st.markdown('<div class="banner banner-approved"><span>✓</span>Safety check passed — note reflects consultation content</div>',
+            st.markdown('<div class="banner banner-approved"><svg class="check" viewBox="0 0 10 8" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M1 4L3.5 6.5L9 1" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>Safety check passed - note reflects consultation content</div>',
                         unsafe_allow_html=True)
 
         # Extracted entities summary (collapsible)
@@ -966,8 +970,10 @@ with tab_ambient:
     # ── STAGE: DONE ──────────────────────────────────────────────────
     elif amb_stage == "done":
         amb_s = st.session_state.ambient_state
-        st.markdown('<div class="banner banner-approved"><span>✓</span>SOAP note approved and ready to file</div>',
-                    unsafe_allow_html=True)
+        if getattr(amb_s, "final_note", None):
+            # Final note is ready
+            st.markdown('<div class="banner banner-approved"><svg class="check" viewBox="0 0 10 8" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M1 4L3.5 6.5L9 1" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>SOAP note approved and ready to file</div>',
+                        unsafe_allow_html=True)
         st.markdown('<div class="panel-eyebrow with-dot"><span class="eyebrow-dot"></span>FINAL SOAP NOTE</div>',
                     unsafe_allow_html=True)
         render_report_panel(amb_s.final_note)
