@@ -278,6 +278,12 @@ class MIRAEngineProd:
         self._build_tools()
         self._build_graph()
 
+    def set_runtime_adapter(self, hospital_id: str, adapter) -> None:
+        """Bind a session adapter (Excel/CSV demo) so queries use it immediately."""
+        self._adapters[hospital_id] = adapter
+        self._trend_agents.pop(hospital_id, None)
+        logger.info("Runtime adapter set for hospital '%s': %s", hospital_id, type(adapter).__name__)
+
     # ── LLM retry helper ────────────────────────────────────────────────
     def _llm_with_retry(self, messages: list, caller: str = "llm"):
         """
@@ -441,12 +447,19 @@ class MIRAEngineProd:
                     f"Hospital '{hospital_id}' FHIR config is missing 'base_url'. "
                     "Fix the hospital configuration before running queries."
                 )
-        elif source_type in ("sql", "postgres", "postgresql", "sqlite", ""):
+        elif source_type in ("sql", "postgres", "postgresql", "sqlite", "db", ""):
             conn_str = data_cfg.get("connection_string", "").strip()
             if not conn_str:
                 raise ValueError(
                     f"Hospital '{hospital_id}' SQL config is missing "
                     "'connection_string'. Fix the hospital configuration."
+                )
+        elif source_type == "flat_file":
+            if not (data_cfg.get("path") or data_cfg.get("bytes") is not None
+                    or data_cfg.get("google_sheets_url")):
+                raise ValueError(
+                    f"Hospital '{hospital_id}' flat_file config needs a path, "
+                    "uploaded bytes, or Google Sheets URL."
                 )
 
         # ── Attempt to build adapter + test connectivity ──────────────────
@@ -478,7 +491,7 @@ class MIRAEngineProd:
     def _get_trend_agent(self, hospital_id: str) -> Optional[TrendAgent]:
         if hospital_id not in self._trend_agents:
             adapter = self._get_adapter(hospital_id)
-            if isinstance(adapter, DBAdapter):
+            if hasattr(adapter, "engine") and hasattr(adapter, "_table_map"):
                 try:
                     self._trend_agents[hospital_id] = TrendAgent(adapter)
                 except Exception:
@@ -557,7 +570,7 @@ class MIRAEngineProd:
             return guidelines_json
 
     # ── Patient existence check (adapter-aware — works for any schema) ────
-    def _check_patients_exist(self, patient_ids: list[int], hospital_id: str) -> tuple[list, list]:
+    def _check_patients_exist(self, patient_ids: list, hospital_id: str) -> tuple[list, list]:
         """Returns (found_ids, missing_ids) via the adapter's concept-mapped
         lookup — no hardcoded table/column names."""
         adapter = self._get_adapter(hospital_id)

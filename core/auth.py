@@ -27,6 +27,7 @@ INSTALL:
 """
 
 import logging
+import os
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Optional
@@ -380,7 +381,8 @@ def _render_login_form(auth_manager: "AuthManager"):
             st.error("Invalid email or password.")
 
     st.markdown("")
-    st.caption("Dev credentials: clinician@mira.dev / mira_clinician_2024")
+    if (os.environ.get("MIRA_ENV") or "development") != "production":
+        st.caption("Dev credentials: clinician@mira.dev / mira_clinician_2024")
 
 
 # ══════════════════════════════════════════════════════════════════════════

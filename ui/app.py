@@ -259,7 +259,10 @@ if not user:
                 st.error("Invalid email or password.")
 
         st.markdown("")
-        st.caption("Dev: clinician@mira.dev / mira_clinician_2024")
+        if cfg.deployment_env != "production":
+            st.caption("Dev: clinician@mira.dev / mira_clinician_2024")
+        from core.trust import login_trust_html
+        st.markdown(login_trust_html(), unsafe_allow_html=True)
         st.markdown("</div>", unsafe_allow_html=True)
 
     st.stop()
@@ -273,6 +276,25 @@ role_dot_class = "admin" if user.role == Role.ADMIN else "clinician"
 is_running = st.session_state.stage == "running" or st.session_state.get("_ambient_processing")
 mark_cls = "mira-mark is-thinking" if is_running else "mira-mark"
 
+# DB health — run a fast check once per session (cached in session_state)
+if st.session_state.get("_flat_file_adapter") is not None:
+    engine.set_runtime_adapter(user.hospital_id, st.session_state["_flat_file_adapter"])
+
+if "_db_health" not in st.session_state:
+    try:
+        _probe = engine._get_adapter(user.hospital_id)
+        st.session_state["_db_health"] = _probe.test_connection()
+    except Exception:
+        st.session_state["_db_health"] = None
+
+_dbh = st.session_state.get("_db_health")
+if _dbh is None:
+    _db_dot_color, _db_dot_label = "#8FA3AE", "DB: unknown"
+elif _dbh.get("ok"):
+    _db_dot_color, _db_dot_label = "#1E8A7A", f"DB: {_dbh.get('latency_ms',0)} ms"
+else:
+    _db_dot_color, _db_dot_label = "#C9501F", "DB: unreachable"
+
 st.markdown(f"""
 <div class="mira-header">
     <div class="mira-header-left">
@@ -283,6 +305,10 @@ st.markdown(f"""
         </div>
     </div>
     <div class="header-right">
+        <div style="display:flex;align-items:center;gap:5px;">
+            <span style="color:{_db_dot_color};font-size:9px;">●</span>
+            <span style="font-size:11px;color:#5C7A89;">{_db_dot_label}</span>
+        </div>
         <div class="live-pill">
             <div class="live-dot"></div>
             <div class="live-pill-text">System active</div>
@@ -1021,6 +1047,17 @@ with tab_ambient:
 
 if tab_admin and user.can("view_audit_log"):
     with tab_admin:
+        st.markdown('<div style="height:8px;"></div>', unsafe_allow_html=True)
+
+        # ── Hospital DB Setup ──────────────────────────────────────────────
+        with st.expander("🔌 Database Connection Setup", expanded=st.session_state.get("_db_health", {}) and not st.session_state.get("_db_health", {}).get("ok")):
+            render_hospital_setup_form(config_manager)
+            if st.button("🔄 Refresh DB Status", key="btn_refresh_db"):
+                # Clear cached health so it re-runs on next render
+                st.session_state.pop("_db_health", None)
+                st.session_state.pop("_last_conn_test", None)
+                st.rerun()
+
         st.markdown('<div style="height:8px;"></div>', unsafe_allow_html=True)
 
         # ── Stats row ─────────────────────────────────────────────────────

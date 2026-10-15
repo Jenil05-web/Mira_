@@ -1,0 +1,21 @@
+uhid,reg_no,patient_name,gender,dob,age,mobile_no,address,admit_date,discharge_dt,provisional_diagnosis,ward,consultant
+1001,MRD-1001,Rajesh Sharma,Male,1951-12-09,43,9339670711,Surat,2024-12-04,2024-11-24,Liver Cirrhosis,General,Dr. K. Iyer
+1002,MRD-1002,Priya Patel,Male,1951-02-07,42,9642621108,Gandhinagar,2024-01-18,2024-04-23,UTI,Nephrology,Dr. K. Iyer
+1003,MRD-1003,Mohammed Shaikh,Female,1978-10-09,28,9914763202,Surat,2024-12-14,2024-06-09,Chronic Kidney Disease Stage 3,ICU,Dr. R. Patel
+1004,MRD-1004,Sunita Verma,Male,1955-07-04,50,9469319644,Gandhinagar,2024-05-26,2024-01-24,Anaemia,Nephrology,Dr. Amit Shah
+1005,MRD-1005,Arjun Mehta,Female,1955-09-10,68,9764130526,Vadodara,2024-10-07,2024-12-03,Diabetes Mellitus Type 2,ICU,Dr. R. Patel
+1006,MRD-1006,Kavitha Nair,Male,1964-02-13,45,9586845604,Vadodara,2024-03-12,2024-06-07,UTI,Medical Ward,Dr. Amit Shah
+1007,MRD-1007,Amit Singh,Male,1990-03-18,74,9362863730,Surat,2024-08-13,2024-05-21,COPD,Nephrology,Dr. Priya Mehta
+1008,MRD-1008,Deepa Rao,Male,1999-01-08,30,9964411347,Vadodara,2024-07-09,2024-02-07,Hypothyroidism,Medical Ward,Dr. Priya Mehta
+1009,MRD-1009,Vikram Joshi,Female,1975-11-15,37,9384412919,Surat,2024-04-24,2024-09-18,Ischemic Heart Disease,Nephrology,Dr. K. Iyer
+1010,MRD-1010,Rekha Gupta,Male,1975-06-08,36,9647099690,Rajkot,2024-02-25,2024-01-28,Hypertension,ICU,Dr. Priya Mehta
+1011,MRD-1011,Suresh Iyer,Female,1988-02-13,52,9739830322,Rajkot,2024-09-09,2024-09-28,Diabetes Mellitus Type 2,General,Dr. R. Patel
+1012,MRD-1012,Anita Desai,Male,1957-05-14,38,9587182120,Ahmedabad,2024-12-24,2024-05-17,Chronic Kidney Disease Stage 3,Nephrology,Dr. Amit Shah
+1013,MRD-1013,Ramesh Kumar,Male,1990-09-20,40,9264109919,Vadodara,2024-03-18,2024-09-01,Hypothyroidism,Medical Ward,Dr. K. Iyer
+1014,MRD-1014,Pooja Shah,Male,1957-06-27,47,9357109965,Ahmedabad,2024-04-19,2024-02-03,COPD,Surgical,Dr. Amit Shah
+1015,MRD-1015,Ashok Tiwari,Male,1999-03-05,70,9610330567,Gandhinagar,2024-03-09,2024-09-28,Hypothyroidism,Surgical,Dr. Priya Mehta
+1016,MRD-1016,Meera Pillai,Male,1998-12-23,40,9865523129,Vadodara,2024-07-22,2024-11-12,Anaemia,Nephrology,Dr. K. Iyer
+1017,MRD-1017,Sanjay Mishra,Male,1965-04-03,49,9122585366,Gandhinagar,2024-09-08,2024-10-08,Diabetes Mellitus Type 2,General,Dr. Amit Shah
+1018,MRD-1018,Fatima Bano,Female,1954-01-28,49,9176082500,Gandhinagar,2024-04-09,2024-11-16,Acute Kidney Injury,Nephrology,Dr. Priya Mehta
+1019,MRD-1019,Harish Reddy,Male,1986-08-08,78,9607850824,Rajkot,2024-04-04,2024-02-22,Sepsis,Medical Ward,Dr. K. Iyer
+1020,MRD-1020,Lata Pandey,Female,1979-12-02,71,9801642483,Ahmedabad,2024-01-13,2024-12-11,Hypertension,ICU,Dr. Priya Mehta

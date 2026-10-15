@@ -169,7 +169,8 @@ VOICE_LANGUAGE_CODES = {"english": "en", "hindi": "hi", "gujarati": "gu"}
 
 CONDITION_VOCAB: dict[str, dict] = {
     "aki": {
-        "aliases": ["aki", "acute kidney injury", "kidney injury", "renal failure", "renal injury"],
+        "aliases": ["aki", "acute kidney injury", "kidney injury", "renal failure", "renal injury",
+                    "creatinine serum", "sr creatinine", "blood urea"],
         "sql_hint": (
             "For acute kidney injury (AKI): look at creatinine "
             "(d.label ILIKE '%creatinine%') where valuenum is elevated above "
@@ -198,7 +199,7 @@ CONDITION_VOCAB: dict[str, dict] = {
         "search_terms": "hypokalemia low potassium management",
     },
     "anemia": {
-        "aliases": ["anemia", "anaemia", "low hemoglobin", "low hematocrit"],
+        "aliases": ["anemia", "anaemia", "low hemoglobin", "low haemoglobin", "low hb", "low hematocrit"],
         "sql_hint": (
             "For anemia: d.label ILIKE '%hemoglobin%' OR d.label ILIKE '%hematocrit%', "
             "with valuenum < ref_range_lower."
@@ -206,7 +207,7 @@ CONDITION_VOCAB: dict[str, dict] = {
         "search_terms": "anemia low hemoglobin hematocrit workup",
     },
     "hyperglycemia": {
-        "aliases": ["hyperglycemia", "high glucose", "high blood sugar"],
+        "aliases": ["hyperglycemia", "high glucose", "high blood sugar", "hba1c", "hb a1c"],
         "sql_hint": "For hyperglycemia: d.label ILIKE '%glucose%' AND l.valuenum > l.ref_range_upper.",
         "search_terms": "hyperglycemia elevated glucose management",
     },
@@ -221,7 +222,8 @@ CONDITION_VOCAB: dict[str, dict] = {
         "search_terms": "hypoxia low oxygen saturation management",
     },
     "liver injury": {
-        "aliases": ["liver injury", "hepatic injury", "liver failure", "hepatic failure"],
+        "aliases": ["liver injury", "hepatic injury", "liver failure", "hepatic failure",
+                    "sgpt", "sgot", "alt sgpt", "ast sgot"],
         "sql_hint": (
             "For liver injury: d.label ILIKE '%bilirubin%' OR d.label ILIKE '%alt%' OR "
             "d.label ILIKE '%ast%', with valuenum > ref_range_upper."
@@ -234,7 +236,7 @@ CONDITION_VOCAB: dict[str, dict] = {
         "search_terms": "thrombocytopenia low platelet count causes",
     },
     "leukocytosis": {
-        "aliases": ["leukocytosis", "high white blood cell", "high wbc"],
+        "aliases": ["leukocytosis", "high white blood cell", "high wbc", "high tlc"],
         "sql_hint": "For leukocytosis: d.label ILIKE '%white blood cell%' AND l.valuenum > l.ref_range_upper.",
         "search_terms": "leukocytosis elevated white blood cell count causes",
     },
@@ -290,12 +292,21 @@ def parse_clinical_intent(question: str) -> dict:
     q = (question or "").lower()
 
     # ---- Patient ID extraction (supports single or multiple IDs) ----
-    id_block_match = re.search(
-        r"patients?\s*(?:id[s]?)?\s*[:#]?\s*((?:\d{2,}\s*(?:,|and|&)?\s*)+)", q
+    patient_ids: list = []
+    uhid_match = re.search(
+        r"\b(?:uhid|mrn|cr\s*no|reg(?:istration)?\s*no|mrd|ip\s*no|op\s*no)"
+        r"[\s:#-]*([A-Za-z0-9][A-Za-z0-9\-]{1,20})",
+        question or "",
+        re.IGNORECASE,
     )
-    patient_ids: list[int] = []
-    if id_block_match:
-        patient_ids = [int(x) for x in re.findall(r"\d{2,}", id_block_match.group(1))]
+    if uhid_match:
+        patient_ids = [uhid_match.group(1)]
+    else:
+        id_block_match = re.search(
+            r"patients?\s*(?:id[s]?)?\s*[:#]?\s*((?:\d{2,}\s*(?:,|and|&)?\s*)+)", q
+        )
+        if id_block_match:
+            patient_ids = [int(x) for x in re.findall(r"\d{2,}", id_block_match.group(1))]
 
     # ---- List vs single-patient intent ----
     has_plural_word = bool(re.search(r"\bpatients\b", q))

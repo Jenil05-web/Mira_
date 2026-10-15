@@ -177,6 +177,13 @@ class ConfigManager:
         )
         source_type = self.get("MIRA_DEFAULT_SOURCE_TYPE", "db")
 
+        if source_type == "flat_file":
+            return {
+                "type": "flat_file",
+                "path": self.get("MIRA_DEFAULT_FILE_PATH", ""),
+                "google_sheets_url": self.get("MIRA_DEFAULT_SHEETS_URL", ""),
+            }
+
         if direct_url and source_type == "db":
             return {"type": "db", "connection_string": direct_url}
 
@@ -286,6 +293,80 @@ class ConfigManager:
             f"  GCP backend     : {'✓ active' if len(self._backends) > 1 else '✗ not configured (using env)'}",
         ]
         return "\n".join(lines)
+
+    def validate_hospital_config(self, hospital_id: str = "default") -> dict:
+        """
+        Preflight check for a hospital's configuration before the engine loads.
+        Returns a structured result — never raises, so it's safe to call from UI.
+
+        Returns dict with keys:
+          ok       : bool  — False means the engine will fail to start
+          errors   : list  — blocking problems (must fix)
+          warnings : list  — non-blocking issues (should fix before production)
+          source   : dict  — the resolved data source config (sanitised, no passwords)
+        """
+        errors, warnings = [], []
+
+        # 1. OpenAI key
+        if not self.get("OPENAI_API_KEY"):
+            errors.append("OPENAI_API_KEY is missing — MIRA cannot run without it.")
+
+        # 2. Data source
+        try:
+            source = self.get_data_source(hospital_id)
+        except Exception as e:
+            errors.append(f"Could not resolve data source: {e}")
+            source = {}
+
+        if source.get("type") == "db":
+            conn_str = source.get("connection_string", "")
+            if not conn_str:
+                errors.append("DB connection string is empty.")
+            elif conn_str == "sqlite:///./mira_data/mimic.db":
+                warnings.append(
+                    "Still using the default MIMIC-IV dev database. "
+                    "Set MIRA_DEFAULT_DB_URL to the hospital's actual database."
+                )
+        elif source.get("type") == "fhir":
+            if not source.get("base_url"):
+                errors.append("FHIR base URL is missing.")
+        elif source.get("type") == "flat_file":
+            if not (source.get("path") or source.get("google_sheets_url") or source.get("bytes") is not None):
+                warnings.append(
+                    "Flat-file source selected but no path/upload yet. "
+                    "Use Admin → Upload File, or set MIRA_DEFAULT_FILE_PATH."
+                )
+        else:
+            errors.append(
+                f"Unknown data source type: '{source.get('type')}'. Must be 'db', 'fhir', or 'flat_file'."
+            )
+
+        # 3. JWT secret
+        if not self.get("MIRA_JWT_SECRET"):
+            warnings.append(
+                "MIRA_JWT_SECRET is not set — auth is running in insecure mode. "
+                "Set it before exposing MIRA to any network."
+            )
+
+        # 4. Audit logging
+        if not self.get_audit_config().get("enabled"):
+            warnings.append("Audit logging is disabled — required for HIPAA compliance.")
+
+        # Sanitise connection string before returning (strip passwords)
+        safe_source = dict(source)
+        if "connection_string" in safe_source:
+            import re
+            safe_source["connection_string"] = re.sub(
+                r"(://[^:]+:)[^@]+(@)", r"\1***\2",
+                safe_source["connection_string"]
+            )
+
+        return {
+            "ok":       len(errors) == 0,
+            "errors":   errors,
+            "warnings": warnings,
+            "source":   safe_source,
+        }
 
 
 # ══════════════════════════════════════════════════════════════════════════

@@ -252,3 +252,394 @@ def render_data_sources_expander(active: dict):
             pass
 
 
+def render_connection_status(test_result: dict | None, compact: bool = False):
+    """
+    Renders a colored DB connection status badge.
+    test_result: dict returned by DBAdapter.test_connection(), or None if not yet checked.
+    compact: if True renders just an inline dot+text suitable for the header.
+    """
+    if test_result is None:
+        color, dot, label = "#8FA3AE", "●", "Not checked"
+    elif test_result.get("ok"):
+        latency = test_result.get("latency_ms", 0)
+        n_mapped = len(test_result.get("mapped", {}))
+        color, dot, label = "#1E8A7A", "●", f"Connected · {latency} ms · {n_mapped} concepts mapped"
+    else:
+        color, dot, label = "#C9501F", "●", "Connection failed"
+
+    if compact:
+        st.markdown(
+            f'<span style="color:{color};font-size:10px;margin-right:4px;">{dot}</span>'
+            f'<span style="font-size:11px;color:#5C7A89;">{label}</span>',
+            unsafe_allow_html=True,
+        )
+        return
+
+    # Full status card
+    border = f"1px solid {color}30"
+    bg = f"{color}08"
+    st.markdown(
+        f'<div style="background:{bg};border:{border};border-radius:10px;padding:12px 16px;'
+        f'display:flex;align-items:center;gap:10px;margin-bottom:8px;">'
+        f'<span style="color:{color};font-size:14px;">{dot}</span>'
+        f'<div style="flex:1;">'
+        f'<div style="font-size:13px;font-weight:600;color:#1C2B33;">{label}</div>',
+        unsafe_allow_html=True,
+    )
+
+    if test_result and test_result.get("ok"):
+        mapped = test_result.get("mapped", {})
+        unmapped = test_result.get("unmapped", [])
+        db_type = test_result.get("db_type", "")
+        st.markdown(
+            f'<div style="font-size:12px;color:#5C7A89;margin-top:2px;">'
+            f'{db_type} · {test_result.get("table_count",0)} tables found</div>'
+            f'</div></div>',
+            unsafe_allow_html=True,
+        )
+        if mapped:
+            cols = st.columns(len(mapped))
+            for col, (concept, table) in zip(cols, mapped.items()):
+                with col:
+                    st.markdown(
+                        f'<div style="background:#1E8A7A12;border:1px solid #1E8A7A30;'
+                        f'border-radius:6px;padding:6px 10px;text-align:center;">'
+                        f'<div style="font-size:10px;color:#1E8A7A;font-weight:600;'
+                        f'text-transform:uppercase;letter-spacing:0.05em;">{concept}</div>'
+                        f'<div style="font-size:11px;color:#1C2B33;margin-top:2px;">{table}</div>'
+                        f'</div>',
+                        unsafe_allow_html=True,
+                    )
+        if unmapped:
+            st.markdown(
+                f'<div style="font-size:11px;color:#B98A2E;margin-top:8px;">'
+                f'⚠ Not mapped: {", ".join(unmapped)}'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
+    elif test_result:
+        st.markdown(
+            f'<div style="font-size:12px;color:#C9501F;margin-top:4px;">'
+            f'{test_result.get("error", "Unknown error")}</div>'
+            f'</div></div>',
+            unsafe_allow_html=True,
+        )
+
+
+def render_hospital_setup_form(config_manager) -> dict | None:
+    """
+    Admin-only Hospital DB Setup form.
+    Returns the active adapter if one was set up, otherwise None.
+    config_manager: a ConfigManager instance.
+    """
+    st.markdown(
+        '<div class="panel-eyebrow with-dot"><span class="eyebrow-dot"></span>'
+        'DATA SOURCE SETUP</div>',
+        unsafe_allow_html=True,
+    )
+
+    # ── Source type tabs ──────────────────────────────────────────────────
+    tab_db, tab_file, tab_demo = st.tabs([
+        "🔌 Database (PostgreSQL / MySQL)",
+        "📂 Upload File (Excel / CSV)",
+        "🧪 Demo Mode (Indian Data)",
+    ])
+
+    # ── Tab 1: Direct DB ──────────────────────────────────────────────────
+    with tab_db:
+        st.markdown(
+            '<div style="font-size:13px;color:#5C7A89;margin:8px 0 16px;">'
+            'Connect to your hospital\'s existing database. '
+            'Only <strong>SELECT</strong> access is needed — MIRA never writes data.'
+            '</div>',
+            unsafe_allow_html=True,
+        )
+
+        db_type = st.selectbox(
+            "Database type",
+            ["PostgreSQL", "MySQL", "SQL Server", "SQLite (dev/local)"],
+            index=0, key="setup_db_type",
+        )
+        placeholder_map = {
+            "PostgreSQL":         "postgresql://user:password@host:5432/hospital_db",
+            "MySQL":              "mysql+pymysql://user:password@host:3306/hospital_db",
+            "SQL Server":         "mssql+pyodbc://user:password@host/hospital_db?driver=ODBC+Driver+17+for+SQL+Server",
+            "SQLite (dev/local)": "sqlite:///./mira_data/mimic.db",
+        }
+        conn_str = st.text_input(
+            "Connection string",
+            placeholder=placeholder_map.get(db_type, ""),
+            type="password", key="setup_conn_str",
+            help="Credentials are only used to open the connection — never stored in MIRA logs.",
+        )
+
+        col_test, col_save, _ = st.columns([1, 1, 3])
+        with col_test:
+            if st.button("🔌 Test Connection", use_container_width=True,
+                         key="btn_test_conn", disabled=not conn_str):
+                with st.spinner("Connecting…"):
+                    try:
+                        from adapters.db import DBAdapter
+                        _a = DBAdapter(conn_str)
+                        _r = _a.test_connection()
+                        st.session_state["_last_conn_test"] = _r
+                        st.session_state["_active_source"] = "db"
+                    except Exception as e:
+                        st.session_state["_last_conn_test"] = {
+                            "ok": False, "error": str(e),
+                            "latency_ms": 0, "mapped": {}, "unmapped": [],
+                            "table_count": 0, "db_type": "unknown",
+                        }
+
+        with col_save:
+            last = st.session_state.get("_last_conn_test", {})
+            if st.button("💾 Save & Apply", use_container_width=True,
+                         key="btn_save_conn",
+                         disabled=not (conn_str and last.get("ok"))):
+                import os
+                env_path = ".env"
+                lines = []
+                if os.path.exists(env_path):
+                    with open(env_path) as f:
+                        lines = [l for l in f.readlines()
+                                 if not l.startswith("MIRA_DEFAULT_DB_URL")]
+                lines.append(f"MIRA_DEFAULT_DB_URL={conn_str}\n")
+                with open(env_path, "w") as f:
+                    f.writelines(lines)
+                st.session_state["_conn_saved"] = True
+                st.toast("Connection saved — restart the app to apply.", icon="💾")
+
+        cached = st.session_state.get("_last_conn_test")
+        if cached is not None and st.session_state.get("_active_source") == "db":
+            render_connection_status(cached)
+
+        if st.session_state.get("_conn_saved"):
+            st.markdown(
+                '<div class="banner banner-approved">'
+                '<svg class="check" viewBox="0 0 10 8" fill="none" xmlns="http://www.w3.org/2000/svg">'
+                '<path d="M1 4L3.5 6.5L9 1" stroke="currentColor" stroke-width="2" '
+                'stroke-linecap="round" stroke-linejoin="round"/></svg>'
+                'Saved to .env. Restart MIRA to connect to the new database.</div>',
+                unsafe_allow_html=True,
+            )
+
+    # ── Tab 2: Flat File Upload ───────────────────────────────────────────
+    with tab_file:
+        st.markdown(
+            '<div style="font-size:13px;color:#5C7A89;margin:8px 0 12px;">'
+            'No database? Upload your patient data directly — Excel, CSV, or Google Sheets. '
+            '<strong>Data stays in memory and is never saved to disk by MIRA.</strong>'
+            '</div>',
+            unsafe_allow_html=True,
+        )
+
+        upload_mode = st.radio(
+            "Source", ["Upload File", "Google Sheets Link"],
+            horizontal=True, key="ff_upload_mode",
+        )
+
+        adapter_result = None
+
+        if upload_mode == "Upload File":
+            uploaded = st.file_uploader(
+                "Upload patient data file",
+                type=["xlsx", "xls", "csv", "ods"],
+                key="ff_uploader",
+                help="Excel sheets: each sheet becomes a table. CSV: one table.",
+            )
+            if uploaded:
+                col_load, _ = st.columns([1, 3])
+                with col_load:
+                    if st.button("📥 Load File", use_container_width=True, key="btn_load_file"):
+                        with st.spinner(f"Loading {uploaded.name}…"):
+                            try:
+                                from adapters.flat_file import FlatFileAdapter
+                                _ff = FlatFileAdapter.from_bytes(uploaded.read(), uploaded.name)
+                                st.session_state["_flat_file_adapter"] = _ff
+                                st.session_state["_flat_file_test"] = _ff.test_connection()
+                                st.session_state["_active_source"] = "flat_file"
+                                st.toast(f"Loaded {uploaded.name}", icon="📂")
+                            except Exception as e:
+                                st.session_state["_flat_file_test"] = {
+                                    "ok": False, "error": str(e),
+                                    "latency_ms": 0, "mapped": {}, "unmapped": [],
+                                    "table_count": 0, "db_type": "unknown",
+                                }
+
+        else:  # Google Sheets
+            sheets_url = st.text_input(
+                "Google Sheets share URL",
+                placeholder="https://docs.google.com/spreadsheets/d/...",
+                key="ff_sheets_url",
+            )
+            if sheets_url:
+                if st.button("🔗 Load from Google Sheets", key="btn_load_sheets"):
+                    with st.spinner("Fetching sheet…"):
+                        try:
+                            from adapters.flat_file import FlatFileAdapter
+                            _ff = FlatFileAdapter.from_google_sheets(sheets_url)
+                            st.session_state["_flat_file_adapter"] = _ff
+                            st.session_state["_flat_file_test"] = _ff.test_connection()
+                            st.session_state["_active_source"] = "flat_file"
+                            st.toast("Google Sheet loaded", icon="📊")
+                        except Exception as e:
+                            st.session_state["_flat_file_test"] = {
+                                "ok": False, "error": str(e),
+                                "latency_ms": 0, "mapped": {}, "unmapped": [],
+                                "table_count": 0, "db_type": "unknown",
+                            }
+
+        ff_test = st.session_state.get("_flat_file_test")
+        if ff_test:
+            render_connection_status(ff_test)
+            if ff_test.get("ok"):
+                rc = ff_test.get("row_counts", {})
+                for tbl, cnt in rc.items():
+                    st.caption(f"  {tbl}: {cnt:,} rows")
+
+    # ── Tab 3: Demo Mode ──────────────────────────────────────────────────
+    with tab_demo:
+        st.markdown(
+            '<div style="font-size:13px;color:#5C7A89;margin:8px 0 12px;">'
+            'Try MIRA instantly with <strong>synthetic Indian hospital data</strong> '
+            '(20 patients, 161 lab results). No database or file needed. '
+            'Names and values are fictional — safe for demonstrations.'
+            '</div>',
+            unsafe_allow_html=True,
+        )
+
+        # Show the sample data preview
+        import pathlib
+        demo_patients = pathlib.Path("mira_data/demo_india_patients.csv")
+        demo_labs = pathlib.Path("mira_data/demo_india_labs.csv")
+
+        if demo_patients.exists():
+            try:
+                import pandas as pd
+                df_p = pd.read_csv(demo_patients)
+                st.markdown("**Sample patients (first 5):**")
+                st.dataframe(df_p[["uhid","patient_name","age","gender",
+                                   "provisional_diagnosis","ward"]].head(5),
+                             use_container_width=True, hide_index=True)
+            except Exception:
+                pass
+
+        col_demo, _ = st.columns([1, 3])
+        with col_demo:
+            if st.button("🧪 Load Demo Data", use_container_width=True, key="btn_load_demo"):
+                if not (demo_patients.exists() and demo_labs.exists()):
+                    st.error("Demo files not found. Run: python mira_data/generate_demo.py")
+                else:
+                    with st.spinner("Loading demo data…"):
+                        try:
+                            from adapters.flat_file import FlatFileAdapter
+                            _ff = FlatFileAdapter()
+                            import pandas as pd
+                            _ff._load_dataframe(pd.read_csv(demo_patients), "patients")
+                            _ff._load_dataframe(pd.read_csv(demo_labs), "investigation_results")
+                            _ff._source_label = "Indian Demo Data"
+                            _ff.discover_schema()
+                            st.session_state["_flat_file_adapter"] = _ff
+                            st.session_state["_flat_file_test"] = _ff.test_connection()
+                            st.session_state["_active_source"] = "flat_file"
+                            st.toast("Demo data loaded — try asking: 'Which patients have high creatinine?'", icon="🧪")
+                        except Exception as e:
+                            st.error(f"Failed to load demo data: {e}")
+
+        if (st.session_state.get("_active_source") == "flat_file"
+                and st.session_state.get("_flat_file_test", {}).get("source_label") == "Indian Demo Data"):
+            st.markdown(
+                '<div class="banner banner-approved">'
+                '<svg class="check" viewBox="0 0 10 8" fill="none" xmlns="http://www.w3.org/2000/svg">'
+                '<path d="M1 4L3.5 6.5L9 1" stroke="currentColor" stroke-width="2" '
+                'stroke-linecap="round" stroke-linejoin="round"/></svg>'
+                'Demo data active. Go to Clinical Audit tab and ask a question.</div>',
+                unsafe_allow_html=True,
+            )
+
+    return st.session_state.get("_flat_file_adapter") or st.session_state.get("_last_conn_test")
+
+    st.markdown(
+        '<div style="font-size:13px;color:#5C7A89;margin-bottom:16px;">'
+        'Connect MIRA to this hospital\'s patient database. '
+        'Only <strong>SELECT</strong> access is required — MIRA never writes to your database.'
+        '</div>',
+        unsafe_allow_html=True,
+    )
+
+    db_type = st.selectbox(
+        "Database type",
+        ["PostgreSQL", "MySQL", "SQL Server", "SQLite (dev/local)"],
+        index=0,
+        key="setup_db_type",
+    )
+
+    placeholder_map = {
+        "PostgreSQL":        "postgresql://user:password@host:5432/hospital_db",
+        "MySQL":             "mysql+pymysql://user:password@host:3306/hospital_db",
+        "SQL Server":        "mssql+pyodbc://user:password@host/hospital_db?driver=ODBC+Driver+17+for+SQL+Server",
+        "SQLite (dev/local)":"sqlite:///./mira_data/mimic.db",
+    }
+
+    conn_str = st.text_input(
+        "Connection string",
+        placeholder=placeholder_map.get(db_type, ""),
+        type="password",
+        key="setup_conn_str",
+        help="Your credentials are used only to open the connection — they are never stored in MIRA logs.",
+    )
+
+    col_test, col_save, _ = st.columns([1, 1, 3])
+
+    test_result = None
+    with col_test:
+        if st.button("🔌 Test Connection", use_container_width=True,
+                     key="btn_test_conn", disabled=not conn_str):
+            with st.spinner("Connecting…"):
+                try:
+                    from adapters.db import DBAdapter
+                    adapter = DBAdapter(conn_str)
+                    test_result = adapter.test_connection()
+                    st.session_state["_last_conn_test"] = test_result
+                    st.session_state["_last_conn_str_display"] = conn_str[:20] + "***"
+                except Exception as e:
+                    test_result = {"ok": False, "error": str(e),
+                                   "latency_ms": 0, "mapped": {}, "unmapped": [],
+                                   "table_count": 0, "db_type": "unknown"}
+                    st.session_state["_last_conn_test"] = test_result
+
+    with col_save:
+        last = st.session_state.get("_last_conn_test", {})
+        if st.button("💾 Save & Apply", use_container_width=True,
+                     key="btn_save_conn",
+                     disabled=not (conn_str and last.get("ok"))):
+            import os
+            # Write to .env (dev) — in production this would go to Secret Manager
+            env_path = ".env"
+            lines = []
+            if os.path.exists(env_path):
+                with open(env_path) as f:
+                    lines = [l for l in f.readlines()
+                             if not l.startswith("MIRA_DEFAULT_DB_URL")]
+            lines.append(f"MIRA_DEFAULT_DB_URL={conn_str}\n")
+            with open(env_path, "w") as f:
+                f.writelines(lines)
+            st.session_state["_conn_saved"] = True
+            st.toast("Connection saved — restart the app to apply.", icon="💾")
+
+    # Show cached result if available
+    cached = st.session_state.get("_last_conn_test")
+    if cached is not None:
+        render_connection_status(cached)
+
+    if st.session_state.get("_conn_saved"):
+        st.markdown(
+            '<div class="banner banner-approved">'
+            '<svg class="check" viewBox="0 0 10 8" fill="none" xmlns="http://www.w3.org/2000/svg">'
+            '<path d="M1 4L3.5 6.5L9 1" stroke="currentColor" stroke-width="2" '
+            'stroke-linecap="round" stroke-linejoin="round"/></svg>'
+            'Connection string saved to .env. Restart MIRA to connect to the new database.</div>',
+            unsafe_allow_html=True,
+        )
+
+    return test_result
